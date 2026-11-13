@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/infinmalum/Lapua/llm"
 )
 
 func TestRecordAndLoadRoundTrip(t *testing.T) {

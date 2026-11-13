@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // drainWithCtx is drain() over a caller-supplied ctx, so a test can cancel the

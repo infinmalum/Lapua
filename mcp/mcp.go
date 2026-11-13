@@ -12,8 +12,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // ToolName builds the three-segment MCP tool name.

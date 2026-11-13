@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/noa"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/noa"
 )
 
 func userText(s string) llm.Message {

@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // rawInputTool is the optional opt-out from schema validation. Discovered by

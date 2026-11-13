@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // streamExec is the streaming tool executor: tool_use blocks are registered as

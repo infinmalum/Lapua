@@ -11,11 +11,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/subagent"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/harness"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/subagent"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // DefaultWorkerPrompt is the default system prompt for worker subagents.

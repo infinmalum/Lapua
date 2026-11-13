@@ -8,9 +8,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/noa"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/noa"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 func edgeSession(t *testing.T) *Session {

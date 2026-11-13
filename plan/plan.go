@@ -11,8 +11,8 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // Approver is the host's plan-approval callback (a CLI prompt, a GUI, or an

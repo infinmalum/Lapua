@@ -23,17 +23,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/compaction"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/hook"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/agentcore"
+	"github.com/infinmalum/Lapua/compaction"
+	"github.com/infinmalum/Lapua/harness"
+	"github.com/infinmalum/Lapua/hook"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 func main() {
-	providerName := flag.String("provider", envOr("AGENT_PROVIDER", "openai"), "anthropic | openai")
+	providerName := flag.String("provider", envOr("AGENT_PROVIDER", "openai"), "anthropic | openai | openai-responses")
 	model := flag.String("model", envOr("AGENT_MODEL", ""), "model id")
 	dir := flag.String("dir", "", "working directory (default cwd)")
 	yes := flag.Bool("yes", false, "auto-approve all tool calls")

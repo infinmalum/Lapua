@@ -4,7 +4,7 @@ Lapua is a Go SDK for building tool-using agents. It provides a streaming execut
 
 Lapua is a fork of [Norma](https://github.com/Autumn-27/Norma), originally created by [Autumn-27](https://github.com/Autumn-27). Original copyright © 2026 Autumn-27. See [LICENSE](LICENSE) for the Apache 2.0 license and copyright notice.
 
-Build with Go 1.26.3 or later. The fork retains the Go module path `github.com/Autumn-27/norma` so existing imports work. Clone [infinmalum/Lapua](https://github.com/infinmalum/Lapua) to build this fork.
+Build with Go 1.26.3 or later. Import SDK packages under `github.com/infinmalum/Lapua`, for example `github.com/infinmalum/Lapua/agentcore`.
 
 ## Packages
 
@@ -51,10 +51,21 @@ go build -o lapua ./cmd/agentcore
 
 ANTHROPIC_API_KEY=... ./lapua -provider anthropic -model your-model-name
 OPENAI_API_KEY=...    ./lapua -provider openai    -model gpt-4o
+OPENAI_API_KEY=...    ./lapua -provider openai-responses -model your-model-name
 ./lapua -provider openai -model gpt-4o -yes -p "summarize the go files here"
 ```
 
 Mutating tools (Write/Edit/Bash) prompt for approval unless `-yes` is set. Supply your own system prompt with `-system FILE`.
+
+## Model API formats
+
+| CLI `-provider` | SDK `llm.Config.Format` | Path appended to the base URL | Environment defaults |
+|---|---|---|---|
+| `anthropic` | `llm.FormatAnthropic` | `/v1/messages` | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`) |
+| `openai` | `llm.FormatOpenAI` | `/chat/completions` | `OPENAI_API_KEY`, `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) |
+| `openai-responses` | `llm.FormatOpenAIResponses` | `/responses` | `OPENAI_API_KEY`, `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) |
+
+Set `-base-url` in the CLI or `llm.Config.BaseURL` in the SDK for a compatible gateway. Include any API prefix the gateway requires, such as `/v1` for the default OpenAI base URL, and leave off the path in the table. Supply the model identifier accepted by that endpoint. All three SDK adapters support streaming and non-streaming requests. The CLI uses streaming. Implement `llm.Provider` to connect a different protocol.
 
 ## Tool permissions
 

@@ -10,7 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/infinmalum/Lapua/llm"
 )
 
 const defaultMaxOutput = 30000

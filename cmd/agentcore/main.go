@@ -15,11 +15,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/infinmalum/Lapua/agentcore"
+	"github.com/infinmalum/Lapua/harness"
+	"github.com/infinmalum/Lapua/llm"
+	"github.com/infinmalum/Lapua/permission"
+	"github.com/infinmalum/Lapua/tool"
 )
 
 // The SDK injects no system prompt, so this host supplies one. Swap it (or use
@@ -28,7 +28,7 @@ const defaultSystem = `You are a helpful coding agent operating in a terminal. U
 
 func main() {
 	var (
-		providerName = flag.String("provider", env("AGENT_PROVIDER", "anthropic"), "anthropic | openai")
+		providerName = flag.String("provider", env("AGENT_PROVIDER", "anthropic"), "anthropic | openai | openai-responses")
 		model        = flag.String("model", env("AGENT_MODEL", ""), "model id (e.g. claude-opus-4-8, gpt-4o)")
 		baseURL      = flag.String("base-url", "", "override API base URL")
 		apiKey       = flag.String("api-key", "", "API key (else ANTHROPIC_API_KEY / OPENAI_API_KEY)")
