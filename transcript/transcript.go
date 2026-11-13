@@ -20,11 +20,13 @@ package transcript
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -77,12 +79,15 @@ func (s *Store) Append(path string, recs ...Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	w := bufio.NewWriter(f)
+	if err := prepareAppend(f, w); err != nil {
+		return err
+	}
 	for _, r := range recs {
 		b, err := json.Marshal(r)
 		if err != nil {
@@ -99,8 +104,11 @@ func (s *Store) Append(path string, recs ...Record) error {
 }
 
 // Load reads all records from a transcript file. A missing file yields no
-// records and no error (a fresh session).
+// records and no error (a fresh session). An incomplete final JSON record
+// without a newline is ignored. A malformed complete line is an error.
 func (s *Store) Load(path string) ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -109,26 +117,85 @@ func (s *Store) Load(path string) ([]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	var recs []Record
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024) // tolerate large tool results
+	recs, _, err := readRecords(f)
+	return recs, err
+}
+
+func readRecords(r io.Reader) (recs []Record, partialAt int64, err error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	// Preserve delimiters so a torn write can be distinguished from a bad
+	// complete line, including when that complete line is the last line.
+	sc.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			return i + 1, data[:i+1], nil
+		}
+		if atEOF && len(data) > 0 {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+	var offset int64
 	for sc.Scan() {
 		line := sc.Bytes()
-		if len(line) == 0 {
+		start := offset
+		offset += int64(len(line))
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var r Record
-		if err := json.Unmarshal(line, &r); err != nil {
-			return nil, fmt.Errorf("transcript: corrupt line: %w", err)
+		var record Record
+		if err := json.Unmarshal(line, &record); err != nil {
+			if line[len(line)-1] != '\n' && isPartialRecord(line) {
+				return recs, start, nil
+			}
+			return nil, -1, fmt.Errorf("transcript: corrupt record at byte %d: %w", start, err)
 		}
-		recs = append(recs, r)
+		recs = append(recs, record)
 	}
-	return recs, sc.Err()
+	return recs, -1, sc.Err()
+}
+
+func isPartialRecord(line []byte) bool {
+	var record json.RawMessage
+	return errors.Is(json.NewDecoder(bytes.NewReader(line)).Decode(&record), io.ErrUnexpectedEOF)
+}
+
+// Before extending an interrupted log, preserve the original file in a private
+// backup. Only discard bytes after the last complete record once the backup
+// has been written and synced.
+func prepareAppend(f *os.File, w *bufio.Writer) error {
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return err
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], info.Size()-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	_, partialAt, err := readRecords(f)
+	if err != nil {
+		return err
+	}
+	if partialAt < 0 {
+		return w.WriteByte('\n')
+	}
+	backup, err := os.CreateTemp(filepath.Dir(f.Name()), filepath.Base(f.Name())+".recovery-*")
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(backup, io.NewSectionReader(f, 0, info.Size()))
+	if err := errors.Join(copyErr, backup.Sync(), backup.Close()); err != nil {
+		return fmt.Errorf("transcript: could not preserve original log in %s: %w", backup.Name(), err)
+	}
+	return f.Truncate(partialAt)
 }
 
 // Messages reconstructs the raw conversation and cumulative usage from records.
-// Boundary records are skipped — the working set is rebuilt by compaction on the
-// next turn, not replayed from disk.
+// Observability-only boundary records are skipped. The persisted boundary
+// message and its working set remain available for replay.
 func Messages(recs []Record) ([]llm.Message, llm.Usage) {
 	var msgs []llm.Message
 	var total llm.Usage
@@ -200,6 +267,9 @@ func (w *Writer) Err() error {
 func (w *Writer) write(r Record) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.err != nil {
+		return // retain a consistent durable prefix after an append failure
+	}
 	r.SessionID = w.sessionID
 	r.AgentID = w.agentID
 	r.IsSidechain = w.isSidechain
@@ -207,9 +277,7 @@ func (w *Writer) write(r Record) {
 	r.ParentUUID = w.last
 	r.Timestamp = w.now().UTC().Format(time.RFC3339Nano)
 	if err := w.store.Append(w.path, r); err != nil {
-		if w.err == nil {
-			w.err = err
-		}
+		w.err = err
 		return
 	}
 	w.last = r.UUID

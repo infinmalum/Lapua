@@ -12,6 +12,7 @@ func echoTool() CoreTool {
 	return Build(Spec{
 		Name:        "echo",
 		Description: "Echoes the msg parameter back.",
+		ReadOnly:    always,
 		Schema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"msg": map[string]any{"type": "string"}},

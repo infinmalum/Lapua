@@ -73,11 +73,8 @@ type Options struct {
 	// message array itself, replacing llm.MessagesForAPI.
 	Compactor harness.Compactor
 
-	// OnWarn, when set, receives configuration warnings raised while building the
-	// session — misconfigurations the SDK works around rather than rejecting. The
-	// SDK writes nothing to stdout/stderr on its own, so a host that wants to see
-	// these must wire them somewhere (log.Printf, a structured logger, a test
-	// buffer). Called synchronously during NewSession.
+	// OnWarn receives configuration warnings during NewSession and transcript
+	// write failures during Prompt. The callback is synchronous.
 	OnWarn func(string)
 
 	// Plan, when non-nil, enables plan mode (read-only exploration → approval →
@@ -241,11 +238,12 @@ type Session struct {
 	messages  []llm.Message
 	usage     llm.Usage
 
-	sessionID string
-	store     *transcript.Store
-	writer    *transcript.Writer
-	tasks     *tool.Manager
-	unlock    *tool.UnlockSet // deferred-tool call gate (nil when no deferred tools)
+	sessionID               string
+	store                   *transcript.Store
+	writer                  *transcript.Writer
+	reportedTranscriptError bool
+	tasks                   *tool.Manager
+	unlock                  *tool.UnlockSet // deferred-tool call gate (nil when no deferred tools)
 }
 
 // NewSession builds a Session, applying defaults.
@@ -356,6 +354,15 @@ func (s *Session) Messages() []llm.Message { return s.messages }
 // Usage returns cumulative token usage.
 func (s *Session) Usage() llm.Usage { return s.usage }
 
+// TranscriptError reports the first append error from the current transcript
+// writer. After an error the session continues in memory.
+func (s *Session) TranscriptError() error {
+	if s.writer == nil {
+		return nil
+	}
+	return s.writer.Err()
+}
+
 // Reset clears the conversation.
 func (s *Session) Reset() { s.messages = nil; s.usage = llm.Usage{} }
 
@@ -382,22 +389,14 @@ func (s *Session) Resume(sessionID string) error {
 	s.usage = usage
 	s.sessionID = sessionID
 	s.writer = s.store.ResumeWriter(sessionID, transcript.LastUUID(recs))
+	s.reportedTranscriptError = false
 	return nil
 }
 
-// cleanResumed drops trailing assistant tool calls whose results were never
-// persisted — a crash mid-tool would otherwise leave a dangling tool_use that
-// the API rejects.
+// cleanResumed removes incomplete tool pairs from the in-memory history.
+// The persisted log still contains the original records.
 func cleanResumed(msgs []llm.Message) []llm.Message {
-	for len(msgs) > 0 {
-		last := msgs[len(msgs)-1]
-		if last.Role == llm.RoleAssistant && len(last.ToolUses()) > 0 {
-			msgs = msgs[:len(msgs)-1]
-			continue
-		}
-		break
-	}
-	return msgs
+	return llm.PairToolBlocks(msgs)
 }
 
 // buildSystemReminder assembles the <system-reminder> content. Today's date is
@@ -529,9 +528,13 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 	inner := harness.Query(ctx, in, s.opts.Deps)
 	return func(yield func(harness.Event, error) bool) {
 		for ev, err := range inner {
+			if writeErr := s.TranscriptError(); writeErr != nil && !s.reportedTranscriptError {
+				s.reportedTranscriptError = true
+				s.warn("transcript persistence stopped: " + writeErr.Error())
+			}
 			if ev.Kind == harness.KindResult && ev.Terminal != nil {
 				s.messages = ev.Terminal.Messages
-				s.usage = ev.Terminal.Usage
+				s.usage.Add(ev.Terminal.Usage)
 			}
 			if !yield(ev, err) {
 				return

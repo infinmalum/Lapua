@@ -141,3 +141,56 @@ func TestDeferredLockedToolRejected(t *testing.T) {
 		t.Fatalf("locked deferred tool should be rejected, got %+v", results)
 	}
 }
+
+func TestDeferredUsesTargetPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		call   string
+		deny   []string
+		locked bool
+	}{
+		{"target denied", tool.ExecuteExtraToolName, []string{"echo"}, false},
+		{"direct call to locked target", "echo", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unlocks := tool.NewUnlockSet()
+			if !tc.locked {
+				unlocks.Add("echo")
+			}
+			input := `{"msg":"hi"}`
+			if tc.call == tool.ExecuteExtraToolName {
+				input = `{"tool_name":"echo","params":{"msg":"hi"}}`
+			}
+			turns := [][]llm.StreamEvent{toolTurn("e1", tc.call, input), textTurn("done")}
+			sess := NewSession(Options{
+				Tools: []tool.CoreTool{deferredEcho()}, DeferredTools: []string{"echo"},
+				UnlockSet: unlocks, DisallowedTools: tc.deny, PermissionMode: permission.ModeBypass,
+				DisableBackgroundTasks: true,
+				Deps: harness.QueryDeps{CallModel: func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+					turn := turns[0]
+					turns = turns[1:]
+					return func(yield func(llm.StreamEvent, error) bool) {
+						for _, ev := range turn {
+							if !yield(ev, nil) {
+								return
+							}
+						}
+					}
+				}},
+			})
+			defer sess.Close()
+			var result *llm.ContentBlock
+			for ev, err := range sess.Prompt(t.Context(), "test policy") {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ev.Kind == harness.KindToolResult {
+					result = ev.ToolResult
+				}
+			}
+			if result == nil || !result.IsError || result.ToolUseID != "e1" {
+				t.Fatalf("expected paired permission rejection, got %+v", result)
+			}
+		})
+	}
+}

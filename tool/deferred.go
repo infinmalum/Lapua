@@ -215,9 +215,9 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 }
 
 // NewExecuteExtraTool builds the always-loaded invoker for deferred tools. It runs
-// the named tool from reg, but only if it is currently in the unlock set. Schema is
-// validated before the call. unlock may be nil (then every registry tool is
-// callable — no gating).
+// the named tool from reg when it is unlocked. Within a harness, the target
+// is dispatched through the active query's tool policy and registry. With no
+// harness, only targets allowed by the default policy can run.
 func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 	return Build(Spec{
 		Name: ExecuteExtraToolName,
@@ -237,6 +237,7 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 			},
 			"required": []any{"tool_name"},
 		},
+		ReadOnly: always, // routing only; the target is authorized separately
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.Allowed()
 		},
@@ -263,8 +264,32 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 			if len(params) == 0 {
 				params = json.RawMessage("{}")
 			}
-			if err := ValidateInput(t.InputSchema(), params); err != nil {
-				return Errorf("Error: invalid params for " + args.ToolName + ": " + err.Error()), nil
+			if args.ToolName == ExecuteExtraToolName {
+				return Errorf("Error: nested deferred dispatch is not supported"), nil
+			}
+			if tc != nil && tc.DispatchDeferred != nil {
+				return tc.DispatchDeferred(args.ToolName, params), nil
+			}
+			raw, _ := t.(interface{ AcceptsRawInput() bool })
+			if raw == nil || !raw.AcceptsRawInput() {
+				if err := ValidateInput(t.InputSchema(), params); err != nil {
+					return Errorf("Error: invalid params for " + args.ToolName + ": " + err.Error()), nil
+				}
+			}
+			pc := permission.Context{Mode: permission.ModeDefault}
+			if tc != nil {
+				pc.WorkingDir = tc.WorkingDir
+			}
+			d := permission.Evaluate(ctx, permission.Request{
+				ToolName: args.ToolName, Input: params, Ctx: pc,
+				IsReadOnly: t.IsReadOnly(params), ToolDecision: t.CheckPermissions(ctx, params, pc),
+			})
+			if d.Behavior != permission.Allow {
+				return Errorf("Tool call was not permitted: " + d.Message), nil
+			}
+			if len(d.UpdatedInput) > 0 {
+				// Standalone calls have no host that can approve rewritten input.
+				return Errorf("Tool call was not permitted: standalone deferred input was rewritten"), nil
 			}
 			return t.Call(ctx, params, tc)
 		},

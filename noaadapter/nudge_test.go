@@ -260,3 +260,16 @@ func TestEnableAppendsResidentPromptOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestEmergencyNudgeBreaksExistingSuppression(t *testing.T) {
+	sess, msgs := pressureSession(t)
+	cfg := sess.Config()
+	sess.attempts = cfg.MaxCompressAttempts
+	sess.suppressedAtTokens = int(float64(cfg.ModelContextLimit)*cfg.Nudge.EmergencyThresholdPct) - 10
+	sess.noteProviderTokens(sess.suppressedAtTokens + 20)
+	// The latest event must be a tool result so a new user turn does not clear suppression.
+	msgs = append(msgs, toolResult("ta", "latest output"))
+	if !viewHasNudge(sess.View(msgs)) {
+		t.Fatal("the emergency band did not release prior suppression")
+	}
+}

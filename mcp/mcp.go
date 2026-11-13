@@ -12,7 +12,6 @@ import (
 	"io"
 	"sync"
 
-	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/tool"
 )
@@ -47,7 +46,7 @@ func InProcessServer(server string, tools []InProcessTool) []tool.CoreTool {
 				if err != nil {
 					return tool.Errorf("Error: " + err.Error()), nil
 				}
-				return tool.Text(tool.Capture(tc, text)), nil
+				return tool.CapResult(tc, tool.Text(text)), nil
 			},
 		}))
 	}
@@ -243,7 +242,9 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 			for _, blk := range res.Content {
 				text += blk.Text
 			}
-			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: res.IsError}, nil
+			out := tool.Text(text)
+			out.IsError = res.IsError
+			return tool.CapResult(tc, out), nil
 		},
 	})
 }

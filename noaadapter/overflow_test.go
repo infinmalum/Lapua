@@ -81,21 +81,7 @@ func TestIsOverflowRecognisesProviderPhrasings(t *testing.T) {
 	}
 }
 
-// overflowState documents itself as mining the error for the provider's real
-// window — "rather than guessing again next turn, the error is mined for the
-// actual number and the mechanical valve is armed so the next view is built to
-// fit."
-//
-// Nothing does that. ParseOverflowWindow and overflowState.learn have no callers
-// anywhere in the tree: harness.Compactor.Reactive receives only the message
-// array, and IsOverflow — the one method that does see the error — throws it
-// away. So arm() always falls back to the CONFIGURED limit, which is exactly the
-// number the provider just rejected.
-//
-// Either wire learning in (IsOverflow is the natural place: it already has the
-// error) or delete the mechanism and the comment that promises it. Leaving it is
-// the worst option, because the comment describes behaviour the code does not
-// have.
+// Reactive uses the provider's reported window for its retry ceiling.
 func TestOverflowLearningIsWiredIn(t *testing.T) {
 	c := &Compactor{sess: simSession(t, 200000)}
 
@@ -106,20 +92,17 @@ func TestOverflowLearningIsWiredIn(t *testing.T) {
 	}
 
 	// The loop's actual sequence: detect, then recover.
-	c.IsOverflow(err)
-	c.Reactive(t.Context(), nil)
+	if !c.IsOverflow(err) {
+		t.Fatal("expected overflow rejection")
+	}
+	if _, ok := c.Reactive(t.Context(), nil); !ok {
+		t.Fatal("expected empty candidate to fit the learned window")
+	}
 
 	floor := c.overflow.armedFloor()
-	if floor == 0 {
-		t.Skip("Reactive disarmed because it could not shrink an empty view")
-	}
 	want := int(float64(128000) * 0.95)
 	if floor != want {
-		t.Fatalf("the armed floor is %d (95%% of the CONFIGURED %d), not %d (95%% of the %d "+
-			"the provider reported). ParseOverflowWindow and overflowState.learn have no "+
-			"callers, so the learned window is never learned and the next view is rebuilt to "+
-			"a limit the provider has already rejected.",
-			floor, c.sess.Config().ModelContextLimit, want, 128000)
+		t.Fatalf("retry ceiling = %d, want %d", floor, want)
 	}
 }
 
@@ -128,7 +111,8 @@ func TestParseOverflowWindowCoversItsPatterns(t *testing.T) {
 	cases := map[string]int{
 		"This model's maximum context length is 200000 tokens": 200000,
 		"context window of 131072 exceeded":                    131072,
-		"max_tokens must be less than 8192":                    8192,
+		"max_tokens must be less than 8192":                    0,
+		"prompt is too long: 215000 tokens > 200000 maximum":   200000,
 		"requests are limited to 32000 tokens":                 32000,
 		"rate limit exceeded":                                  0,
 		"maximum context length is zero":                       0,

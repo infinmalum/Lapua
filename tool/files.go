@@ -88,7 +88,10 @@ func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 		}
 		return Text("(no lines in the requested range)"), nil
 	}
-	return Text(readCapture(tc, b.String(), start)), nil
+	res := Text(readCapture(tc, b.String(), start))
+	// Read already limits its output and supplies an exact continuation offset.
+	res.cappedAt = maxOut(tc)
+	return res, nil
 }
 
 // readOutputBonus lifts the Read tool's output budget above the shared default
@@ -121,7 +124,7 @@ func headWithinBudget(s string, max int) (string, int) {
 	}
 	cut := strings.LastIndexByte(s[:max], '\n')
 	if cut < 0 {
-		return s[:max], 0
+		return cutHead(s, max), 0
 	}
 	head := s[:cut+1]
 	return head, strings.Count(head, "\n")

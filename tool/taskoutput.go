@@ -70,5 +70,5 @@ func runTaskOutput(ctx context.Context, input json.RawMessage, tc *ToolContext) 
 		header += fmt.Sprintf(" | exit %d", info.ExitCode)
 	}
 	header += "]\n"
-	return Text(Capture(tc, header+out)), nil
+	return CapResult(tc, Text(header+out)), nil
 }

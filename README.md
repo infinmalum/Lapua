@@ -1,24 +1,23 @@
-# Norma
+# Lapua
 
-A general-purpose **Agent Harness SDK in Go**. Norma is the engine that turns a language model into an autonomous agent: a streaming tool-use loop that lets a model read, run, and reason its way through a task while you keep control of the prompt, the tools, and the safety boundary.
+Lapua is a Go SDK for building tool-using agents. It provides a streaming execution loop, host-controlled tool permissions, and conversation state behind `agentcore.Session`. It supports the Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses APIs.
 
-You point it at any model (via the **Anthropic** *or* **OpenAI** wire format), drive it with a **host-controlled system prompt**, and extend it with your own tools, permission policy, hooks, and subagents. It ships as a focused, near-dependency-free library — the loop, scheduler, and safety boundary are provider- and scenario-agnostic: they don't know whether they're driving a coding agent, a security auditor, or a customer-support bot.
+Lapua is a fork of [Norma](https://github.com/Autumn-27/Norma), originally created by [Autumn-27](https://github.com/Autumn-27). Original copyright © 2026 Autumn-27. See [LICENSE](LICENSE) for the Apache 2.0 license and copyright notice.
 
-**What you get out of the box:** dual-format streaming, a fail-closed tool system with the standard file/shell toolset, a four-stage permission pipeline, automatic context-window management, lifecycle hooks, subagents, MCP, plan mode, long-term memory, a skill system, background tasks, and multi-agent coordination — all behind one stateful `Session`.
-
-Module path: `github.com/Autumn-27/norma` · Go 1.23+ (uses `iter`).
+Build with Go 1.26.3 or later. The fork retains the Go module path `github.com/Autumn-27/norma` so existing imports work. Clone [infinmalum/Lapua](https://github.com/infinmalum/Lapua) to build this fork.
 
 ## Packages
 
 | Package | Responsibility |
 |---|---|
-| `llm` | Vendor-neutral message model (`Message`/`ContentBlock`/`StreamEvent`) + `Provider` interface. `NewProvider(Config{Format})` builds an **Anthropic** or **OpenAI** adapter; both stream and support tool calls, normalized to one event type. |
+| `llm` | Vendor-neutral message model (`Message`/`ContentBlock`/`StreamEvent`) + `Provider` interface. `NewProvider(Config{Format})` selects Anthropic Messages, OpenAI Chat Completions, or OpenAI Responses. Each adapter normalizes streaming and tool calls into the same event type. |
 | `tool` | `CoreTool` contract, fail-closed `Build` factory, `Registry`, a lightweight JSON-Schema validator, and the core tools: **Read, Write, Edit, MultiEdit, LS, Glob, Grep, Bash** (default set) plus opt-in **WebFetch** / **WebSearch** (network, permission-gated), **TodoWrite** (stateful planning), **AskUserQuestion** (structured mid-task questions), background-task tools (**TaskOutput/TaskStop/TaskList/Monitor**), and **deferred tools** — schemas withheld from the model to save context, discovered on demand via `SearchExtraTools` and invoked through `ExecuteExtraTool`. |
-| `permission` | The safety boundary: `allow`/`deny`/`ask` decisions, six `PermissionMode`s, allow/deny rules with deny-priority, and the four-stage `Evaluate` pipeline. |
-| `harness` | The loop: `Query` streams `Event`s (`iter.Seq2`), schedules tools (parallel for read-only, serial for mutating), pairs every `tool_use` with a `tool_result` (synthetic on deny/abort), enforces termination reasons, and threads cancellation. `QueryDeps` injects side effects for testing. |
+| `permission` | Evaluates allow and deny rules, tool policy, permission mode, and host approval. Deny rules take priority, including for deferred targets and nested agent calls. |
+| `harness` | The loop: `Query` streams `Event`s (`iter.Seq2`), schedules tools that declare concurrency safety in parallel and other tools exclusively, pairs every `tool_use` with a `tool_result` (synthetic on deny/abort), enforces termination reasons, and threads cancellation. `QueryDeps` injects side effects for testing. |
 | `compaction` | Context-window management: Snip / MicroCompact / Context Collapse / AutoCompact, a circuit breaker, reactive recovery from prompt-too-long, and non-destructive `compact_boundary` summaries. Invoked skills are re-injected verbatim after each boundary so their instructions survive summarization. |
+| `noa` / `noaadapter` | Optional model-driven compression. The adapter supplies a projected request view, the Compress tool, and durable archives. |
 | `hook` | Eight lifecycle hooks (PreToolUse, PostToolUse, Stop, …) as Go callbacks that can block, rewrite input, inject context, or gate the Stop transition. |
-| `subagent` | An `Agent` tool that delegates to isolated child agents reusing the same loop, with a recursion-depth guard. |
+| `subagent` | An `Agent` tool that delegates to isolated child agents reusing the same loop, with a recursion-depth guard and the enclosing tool permission policy. |
 | `mcp` | Model Context Protocol integration: a stdio JSON-RPC client and in-process servers, exposing tools as `mcp__<server>__<tool>`. |
 | `plan` | Plan mode: read-only exploration → `ExitPlanMode` presents a plan for approval → the permission mode flips mid-loop so the agent can implement. |
 | `memory` | Persistent long-term memory: markdown-with-frontmatter files + a `MEMORY.md` index, relevance selection, staleness warnings, and `RecallMemory`/`RecordMemory` tools. |
@@ -48,21 +47,26 @@ for ev, err := range sess.Prompt(ctx, "Add a /health endpoint and run the tests.
 ## CLI demo
 
 ```bash
-go build -o agentcore ./cmd/agentcore
+go build -o lapua ./cmd/agentcore
 
-ANTHROPIC_API_KEY=... ./agentcore -provider anthropic -model your-model-name
-OPENAI_API_KEY=...    ./agentcore -provider openai    -model gpt-4o
-./agentcore -provider openai -model gpt-4o -yes -p "summarize the go files here"
+ANTHROPIC_API_KEY=... ./lapua -provider anthropic -model your-model-name
+OPENAI_API_KEY=...    ./lapua -provider openai    -model gpt-4o
+./lapua -provider openai -model gpt-4o -yes -p "summarize the go files here"
 ```
 
 Mutating tools (Write/Edit/Bash) prompt for approval unless `-yes` is set. Supply your own system prompt with `-system FILE`.
 
-## Design highlights
+## Tool permissions
 
-- **Dual wire formats, one model.** Both adapters translate to/from a single Anthropic-style content-block model, so the loop and tools never change when you switch providers. Reasoning models' `reasoning_content` surfaces as thinking events.
-- **Host owns the prompt.** The SDK ships no preset system prompt — `Options.SystemPrompt` is yours. Coding / security-audit prompts live in `examples/`, not the core.
-- **Fail-closed tools.** New tools default to not-read-only, not-concurrency-safe, approval-required. Read-only tools opt in and become eligible for parallel execution.
-- **`iter.Seq2` streaming.** `Prompt` and `Query` are range-over-func iterators; cancellation is via `context.Context`.
+`AllowedTools` and `DisallowedTools` accept exact tool names or `*`. Argument selectors such as `Bash(git:*)` are unsupported and deny calls to the named tool. For argument-specific approval, evaluate the arguments in the host's `CanUseTool` callback and leave the tool subject to approval. The permission policy gates tool calls. Process and filesystem isolation are the host's responsibility.
+
+Deferred tools omit their schemas from the model's tool list. The model can request their schemas through `SearchExtraTools` and invoke unlocked targets through `ExecuteExtraTool`. Both the wrapper and the target are checked. Child agents inherit the enclosing query's allow and deny rules and default permission mode. An explicitly configured child mode can further restrict calls.
+
+## Context and session state
+
+Use `agentcore.Options.Compaction` for the built-in automatic summarizer, or call `noaadapter.Enable` before creating the session to install model-driven compression. NOA requires a durable `ArchiveBaseDir`. Set `ModelContextLimit` to match the deployment. The adapter supplies its own request view and takes precedence over built-in compaction when both are configured.
+
+`Session.Usage()` accumulates token counts across completed prompts, including counts restored by `Session.Resume`. The usage reported in a prompt's events describes that prompt. When a transcript write fails, the session continues in memory and exposes the error through `Session.TranscriptError()` and the optional `OnWarn` callback. Resume reads complete JSONL records. On the first append after recovery from an incomplete last record, the store saves the original log as a sibling `.recovery-*` file before trimming that record. A malformed complete record causes resume to return an error.
 
 ## Examples
 
@@ -77,8 +81,4 @@ Mutating tools (Write/Edit/Bash) prompt for approval unless `-yes` is set. Suppl
 go test ./...
 ```
 
-Coverage: both provider adapters over `httptest` SSE; the loop end-to-end with a scripted provider (tool execution, message threading, permission denial, max-turns, parallel reads); real tool execution in a temp dir; the permission pipeline matrix; compaction (auto-summary, circuit breaker, micro-compact); hooks (block/rewrite/Stop-gating); subagent dispatch + depth guard; and the MCP client over in-memory pipes.
-
-## Scope
-
-Implements the core loop, dual providers, tools, the full permission pipeline, compaction, hooks, subagents, and MCP — plus plan mode, long-term memory, the skill system, background tasks, deferred tools, transcript persistence with resume, and coordinator multi-agent orchestration.
+Tests cover provider adapters with local HTTP fixtures, tool execution and permission checks, transcript recovery, and simulated long sessions with NOA. The GitHub Actions workflow runs the suite on pushes and pull requests.

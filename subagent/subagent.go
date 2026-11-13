@@ -88,7 +88,7 @@ func NewTool(cfg Config) tool.CoreTool {
 			if !ok {
 				return tool.Errorf(fmt.Sprintf("Error: unknown agent_type %q", in.AgentType)), nil
 			}
-			text, err := run(ctx, cfg, def, in.AgentType, in.Prompt, tc.WorkingDir)
+			text, err := run(ctx, cfg, def, in.AgentType, in.Prompt, tc.WorkingDir, tc.DeferredTools)
 			if err != nil {
 				return tool.Errorf("Error: subagent failed: " + err.Error()), nil
 			}
@@ -105,11 +105,11 @@ func Run(ctx context.Context, cfg Config, agentType, prompt, workDir string) (st
 	if !ok {
 		return "", fmt.Errorf("subagent: unknown agent_type %q", agentType)
 	}
-	return run(ctx, cfg, def, agentType, prompt, workDir)
+	return run(ctx, cfg, def, agentType, prompt, workDir, nil)
 }
 
 // run executes a subagent to completion and returns its final text.
-func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, workDir string) (string, error) {
+func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, workDir string, deferredTools []string) (string, error) {
 	if cfg.Hooks != nil {
 		if hs, ok := cfg.Hooks.(interface {
 			FireSubagentStart(context.Context, string)
@@ -120,16 +120,27 @@ func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, wor
 	registry := filterTools(cfg.ParentTools, def.Tools)
 	childCtx := context.WithValue(ctx, depthKey, depth(ctx)+1)
 
+	mode := def.PermissionMode
+	var allowed, disallowed []string
+	if parent, ok := permission.ParentContext(ctx); ok {
+		allowed, disallowed = parent.Allowed, parent.Disallowed
+		if mode == "" {
+			mode = parent.Mode
+		}
+	}
 	seed := llm.UserText(prompt)
 	in := harness.QueryInput{
 		Provider:       cfg.Provider,
 		System:         def.Prompt,
 		Messages:       []llm.Message{seed},
 		Tools:          registry,
+		DeferredTools:  deferredTools,
 		MaxTurns:       def.MaxTurns,
 		WorkingDir:     workDir,
 		AgentID:        agentType,
-		PermissionMode: def.PermissionMode,
+		PermissionMode: mode,
+		Allowed:        allowed,
+		Disallowed:     disallowed,
 		CanUseTool:     cfg.CanUseTool,
 		Hooks:          cfg.Hooks,
 	}

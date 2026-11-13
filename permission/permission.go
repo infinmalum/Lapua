@@ -24,7 +24,7 @@ const (
 // (FR-05.6).
 type Update struct {
 	Type string `json:"type"` // e.g. "addAllowRule"
-	Rule string `json:"rule"` // e.g. "Bash(git:*)"
+	Rule string `json:"rule"` // tool name or "*"
 }
 
 // Decision is the outcome of a permission check.
@@ -84,7 +84,72 @@ type Request struct {
 // decision. Order encodes deny-priority (FR-05.5): an explicit deny rule wins
 // over every mode, including bypass.
 func Evaluate(ctx context.Context, req Request) Decision {
+	result := decide(req)
+	if result.Behavior == Deny {
+		return result
+	}
+	promptContext := req.Ctx
+	ask := req.Ask
+	for p := parentPolicy(ctx); p != nil; p = p.parent {
+		parentReq := req
+		parentReq.Ctx = p.context
+		parentReq.Ctx.WorkingDir = req.Ctx.WorkingDir
+		decision := decide(parentReq)
+		if decision.Behavior == Deny {
+			return decision
+		}
+		if decision.Behavior == Ask {
+			result = decision
+		}
+		promptContext = parentReq.Ctx
+		ask = p.ask
+	}
+	if result.Behavior != Ask {
+		return result
+	}
+	if ask != nil {
+		d := ask(ctx, req.ToolName, req.Input, promptContext)
+		if d.Behavior == Allow || d.Behavior == Deny {
+			return d
+		}
+		return Denied("denied by approval callback")
+	}
+	return Denied("denied: no approval handler configured for '" + req.ToolName + "'")
+}
+
+type policyKey struct{}
+
+type policy struct {
+	context Context
+	ask     CanUseTool
+	parent  *policy
+}
+
+func parentPolicy(ctx context.Context) *policy {
+	p, _ := ctx.Value(policyKey{}).(*policy)
+	return p
+}
+
+// WithParentPolicy carries the caller's restrictions into nested queries.
+// A nested call must pass every enclosing policy. The outermost host owns
+// interactive approval.
+func WithParentPolicy(ctx context.Context, pc Context, ask CanUseTool) context.Context {
+	return context.WithValue(ctx, policyKey{}, &policy{context: pc, ask: ask, parent: parentPolicy(ctx)})
+}
+
+// ParentContext returns the nearest enclosing query's policy, if present.
+func ParentContext(ctx context.Context) (Context, bool) {
+	if p := parentPolicy(ctx); p != nil {
+		return p.context, true
+	}
+	return Context{}, false
+}
+
+func decide(req Request) Decision {
 	// Stage 1 — deny rules (absolute priority).
+	if invalidRule(req.Ctx.Allowed, req.ToolName) || invalidRule(req.Ctx.Disallowed, req.ToolName) {
+		return Denied("denied: unsupported permission rule for '" + req.ToolName + "'; use a tool name or '*'")
+	}
 	if matchRule(req.Ctx.Disallowed, req.ToolName) {
 		return Denied("denied: tool '" + req.ToolName + "' is disallowed by policy")
 	}
@@ -125,25 +190,25 @@ func Evaluate(ctx context.Context, req Request) Decision {
 	case ModeAuto:
 		return Denied("denied: '" + req.ToolName + "' not permitted by rules in auto mode")
 	}
-	if req.Ask != nil {
-		d := req.Ask(ctx, req.ToolName, req.Input, req.Ctx)
-		if d.Behavior == "" {
-			return Denied("denied by approval callback")
-		}
-		return d
-	}
-	return Denied("denied: no approval handler configured for '" + req.ToolName + "'")
+	return AskUser("approve " + req.ToolName + "?")
 }
 
-// matchRule reports whether toolName matches any rule. A rule is either a bare
-// tool name, "*" (any), or "Name(...)" whose Name part matches.
+// Argument selectors are not supported. Fail closed for the affected tool,
+// including under bypass mode, so a legacy selector cannot broaden access.
+func invalidRule(rules []string, toolName string) bool {
+	for _, rule := range rules {
+		name, _, hasSelector := strings.Cut(strings.TrimSpace(rule), "(")
+		if hasSelector && (strings.TrimSpace(name) == toolName || strings.TrimSpace(name) == "*") {
+			return true
+		}
+	}
+	return false
+}
+
 func matchRule(rules []string, toolName string) bool {
 	for _, r := range rules {
 		r = strings.TrimSpace(r)
 		if r == "*" || r == toolName {
-			return true
-		}
-		if i := strings.IndexByte(r, '('); i > 0 && r[:i] == toolName {
 			return true
 		}
 	}

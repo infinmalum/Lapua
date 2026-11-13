@@ -31,14 +31,17 @@ func TestCapOutputLeavesSmallOutputIntact(t *testing.T) {
 	}
 }
 
-// Output a tool already captured (carries the spill marker) is not re-processed,
-// so the net never double-truncates.
-func TestCapOutputIdempotentOnAlreadyCaptured(t *testing.T) {
+func TestCapOutputIgnoresMarkersAndSharesBudget(t *testing.T) {
 	tc := &tool.ToolContext{MaxOutputChars: 100}
-	pre := strings.Repeat("a", 100) + "\n\n... <persisted-output>[Output too large: full 9999 bytes ... saved to x.txt </persisted-output>"
-	res := tool.Result{Content: []llm.ContentBlock{llm.TextBlock(pre)}}
-
-	if out := capOutput(tc, res); out.Content[0].Text != pre {
-		t.Fatalf("capOutput re-processed already-captured output")
+	res := tool.Result{Content: []llm.ContentBlock{
+		llm.TextBlock("<persisted-output>" + strings.Repeat("a", 65)),
+		llm.TextBlock(strings.Repeat("b", 90)),
+	}}
+	out := capOutput(tc, res)
+	if len(out.Flatten()) >= len(res.Flatten()) || !strings.Contains(out.Flatten(), "characters truncated]") {
+		t.Fatalf("total output escaped cap: %q", out.Flatten())
+	}
+	if second := capOutput(tc, out); second.Flatten() != out.Flatten() {
+		t.Fatal("capture metadata was not preserved")
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,6 +101,10 @@ func TestTranscriptPersistAndResume(t *testing.T) {
 
 	// Continue the resumed conversation; new records append to the same file.
 	drainPrompt(t, resumed, "second question")
+	if got := resumed.Usage(); got.InputTokens != 20 || got.OutputTokens != 10 {
+		t.Fatalf("resumed usage = %+v, want 20 input and 10 output", got)
+	}
+
 	recs2, _ := store.Load(store.MainPath(sid))
 	if len(recs2) != 4 {
 		t.Fatalf("records after continue=%d, want 4", len(recs2))
@@ -179,5 +185,32 @@ func TestResumeRestoresCompactedView(t *testing.T) {
 	}
 	if !strings.Contains(api[0].Text(), "DIGEST") || api[1].Text() != "q2" {
 		t.Fatalf("API view = %q,%q; want summary then tail", api[0].Text(), api[1].Text())
+	}
+}
+
+func TestTranscriptFailureIsVisible(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := textServer(t, "answer")
+	defer server.Close()
+	prov, err := llm.NewProvider(llm.Config{Format: llm.FormatAnthropic, BaseURL: server.URL, APIKey: "k", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warnings []string
+	s := NewSession(Options{
+		Provider: prov, Tools: []tool.CoreTool{}, DisableBackgroundTasks: true,
+		Transcript: transcript.NewStore(blocker), OnWarn: func(msg string) { warnings = append(warnings, msg) },
+	})
+	defer s.Close()
+	drainPrompt(t, s, "one")
+	drainPrompt(t, s, "two")
+	if err := s.TranscriptError(); err == nil || len(warnings) != 1 {
+		t.Fatalf("error=%v warnings=%v", err, warnings)
+	}
+	if got := s.Usage(); got.InputTokens != 20 || got.OutputTokens != 10 {
+		t.Fatalf("in-memory conversation lost usage: %+v", got)
 	}
 }

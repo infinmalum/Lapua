@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Autumn-27/norma/llm"
 )
 
 const defaultMaxOutput = 30000
@@ -27,8 +30,8 @@ var spillSeq atomic.Int64
 // pointer to that file is returned — so the model can read slices on demand
 // (grep/sed) instead of losing the overflow. Without an OutputDir it falls back
 // to a head+tail truncation (the overflow is discarded). Tools that produce
-// potentially large output should return Capture(tc, output) rather than the raw
-// string.
+// potentially large output can return CapResult(tc, Text(output)) to preserve
+// capture metadata when the harness checks the result again.
 //
 // The pointer is always an ABSOLUTE path: a relative one only resolves from the
 // working directory it was computed against, and the reader is often somewhere
@@ -52,28 +55,56 @@ func Capture(tc *ToolContext, s string) string {
 	return truncate(s, max)
 }
 
-// alreadyCaptured reports whether s already carries a marker Capture leaves
-// behind — a spill pointer or a head+tail truncation notice. It is how a global
-// post-tool net recognises output a tool already ran through Capture itself.
-//
-// A false negative (legitimate text that happens to contain a marker) only means
-// the guard fails to re-cap already-large output; it never corrupts. The markers
-// are distinctive enough that this is vanishingly rare.
-func alreadyCaptured(s string) bool {
-	return strings.Contains(s, "<persisted-output>") || strings.Contains(s, "characters truncated]")
-}
+// CaptureOnce bounds output without interpreting its text as capture metadata.
+// Deprecated: use Capture for strings or CapResult for tool results.
+func CaptureOnce(tc *ToolContext, s string) string { return Capture(tc, s) }
 
-// CaptureOnce is Capture with an idempotency guard: output a tool already ran
-// through Capture (so it carries a spill pointer or truncation notice) is
-// returned unchanged. This lets a single post-tool net cap every tool's output
-// without re-truncating or re-spilling what built-in / MCP / custom tools
-// already handled themselves. Output within the limit is a no-op either way,
-// since Capture returns it unchanged.
-func CaptureOnce(tc *ToolContext, s string) string {
-	if alreadyCaptured(s) {
-		return s
+// CapResult applies a shared budget across all content blocks. Capture may add
+// a short truncation notice or an absolute spill path outside the body budget.
+// Extra messages are host-provided conversation instructions and have their own
+// contract (for example, Skill injects instructions verbatim).
+func CapResult(tc *ToolContext, res Result) Result {
+	limit := maxOut(tc)
+	if res.cappedAt > 0 && res.cappedAt <= limit {
+		return res
 	}
-	return Capture(tc, s)
+	remaining := limit
+	textOnly := true
+	for _, block := range res.Content {
+		if block.Type == llm.BlockText {
+			remaining -= 1 + len(block.Text)
+		} else {
+			textOnly = false
+			encoded, err := json.Marshal(block)
+			if err != nil {
+				return Errorf("Error: invalid tool output")
+			}
+			remaining -= len(encoded)
+		}
+	}
+	if remaining >= 0 {
+		return res
+	}
+	var body string
+	if textOnly {
+		var joined strings.Builder
+		for i, block := range res.Content {
+			if i > 0 {
+				joined.WriteByte('\n')
+			}
+			joined.WriteString(block.Text)
+		}
+		body = joined.String()
+	} else {
+		encoded, err := json.Marshal(res.Content)
+		if err != nil {
+			return Errorf("Error: invalid tool output")
+		}
+		body = string(encoded)
+	}
+	res.Content = []llm.ContentBlock{llm.TextBlock(Capture(tc, body))}
+	res.cappedAt = limit
+	return res
 }
 
 func spillOutput(dir, s string) (string, error) {

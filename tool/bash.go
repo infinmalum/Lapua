@@ -141,20 +141,20 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 			// what to change about the command.
 			switch info.Reason {
 			case terminateMemory:
-				return Errorf(Capture(tc, output) + fmt.Sprintf(
+				return cappedError(tc, output, fmt.Sprintf(
 					"\n\n[terminated: the command's process group exceeded the %s per-command memory cap and was killed — stream or page the data instead of accumulating it in memory]",
 					humanBytes(memCapBytes()))), nil
 			case terminateOversize:
-				return Errorf(Capture(tc, output) + fmt.Sprintf(
+				return cappedError(tc, output, fmt.Sprintf(
 					"\n\n[terminated: output exceeded the %s per-task output cap]",
 					humanBytes(maxTaskOutputBytes))), nil
 			}
-			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", Capture(tc, output), info.ExitCode)), nil
+			return cappedError(tc, output, fmt.Sprintf("\n\n[exit code %d]", info.ExitCode)), nil
 		}
 		if strings.TrimSpace(output) == "" {
 			output = "(command produced no output)"
 		}
-		return Text(Capture(tc, output)), nil
+		return CapResult(tc, Text(output)), nil
 	}
 
 	// Timed out while still running.
@@ -167,7 +167,7 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
 	tc.Tasks.Forget(t.ID)
-	return Errorf(Capture(tc, out) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
+	return cappedError(tc, out, fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 }
 
 // runBashSync is the original blocking implementation, used when no task manager
@@ -189,9 +189,9 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	cmd.Stderr = &buf
 	err := cmd.Run()
 
-	out := Capture(tc, buf.String())
+	out := buf.String()
 	if cctx.Err() == context.DeadlineExceeded {
-		return Errorf(out + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
+		return cappedError(tc, out, fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 	}
 	if err != nil {
 		var ee *exec.ExitError
@@ -199,14 +199,25 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 			if out == "" {
 				out = "(no output)"
 			}
-			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", out, ee.ExitCode())), nil
+			return cappedError(tc, out, fmt.Sprintf("\n\n[exit code %d]", ee.ExitCode())), nil
 		}
-		return Errorf(fmt.Sprintf("%s\n\n[failed to run: %v]", out, err)), nil
+		return cappedError(tc, out, fmt.Sprintf("\n\n[failed to run: %v]", err)), nil
 	}
 	if strings.TrimSpace(out) == "" {
 		out = "(command produced no output)"
 	}
-	return Text(out), nil
+	return CapResult(tc, Text(out)), nil
+}
+
+// Keep the termination diagnostic visible even when the command output spills.
+func cappedError(tc *ToolContext, output, diagnostic string) Result {
+	res := CapResult(tc, Text(output))
+	res.Content[0].Text += diagnostic
+	res.IsError = true
+	if len(res.Content[0].Text) > maxOut(tc) {
+		res.cappedAt = maxOut(tc)
+	}
+	return res
 }
 
 // autoBackgroundAllowed reports whether a timed-out command may be moved to the

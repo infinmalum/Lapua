@@ -87,7 +87,7 @@ func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 		b.WriteString(m.path)
 		b.WriteByte('\n')
 	}
-	return Text(Capture(tc, b.String())), nil
+	return CapResult(tc, Text(b.String())), nil
 }
 
 func matchGlob(pattern, path string) bool {
@@ -303,7 +303,7 @@ func runGrep(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	if more > 0 {
 		out += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, in.Offset+len(kept))
 	}
-	return Text(Capture(tc, out)), nil
+	return CapResult(tc, Text(out)), nil
 }
 
 // rgFileTypes maps a ripgrep-style file type to its globs (common subset).

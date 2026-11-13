@@ -158,19 +158,16 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 	cfg Config, adaptive, floor int) {
 
 	tier2Threshold := roundHalfUp(float64(adaptive) * cfg.Nudge.Tier2GrowthMultiplier)
-	// Count-based tier triggers also need a usage floor. Without it a session
-	// with a handful of blocks but a nearly empty context would spend a turn
-	// consolidating for no benefit.
+	// Count-based consolidation is worthwhile under normal context pressure
+	// or when the summaries alone occupy a meaningful part of the window.
+	// Give that backlog a turn before consuming more raw ranges.
 	usageFloor := cfg.Nudge.MinContextLimitPct
-	t2CountReady := tiers[2].count >= cfg.Tiers.Tier2Trigger && d.ContextUsage >= usageFloor
-	t3CountReady := tiers[3].count >= cfg.Tiers.Tier3Trigger && d.ContextUsage >= usageFloor
+	summaryBudget := max(1, cfg.ModelContextLimit/40)
+	t2CountReady := tiers[2].count >= cfg.Tiers.Tier2Trigger &&
+		(d.ContextUsage >= usageFloor || tiers[2].pending >= summaryBudget)
+	t3CountReady := tiers[3].count >= cfg.Tiers.Tier3Trigger &&
+		(d.ContextUsage >= usageFloor || tiers[3].pending >= summaryBudget)
 
-	if tiers[1].pending >= adaptive {
-		d.ShouldInject = true
-		d.Tier = 1
-		d.Reason = fmt.Sprintf("growth: tier 1 has %d pending (>= %d); %s", tiers[1].pending, adaptive, pendingSummary(tiers))
-		return
-	}
 	if cfg.Tiers.Enabled {
 		if t2CountReady || (tiers[2].pending >= tier2Threshold && tiers[2].pending > tiers[1].pending) {
 			if tierCadenceReady(in.State, 2, in.TokenCount, floor) {
@@ -197,6 +194,12 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 			d.Reason = "blocked: T3 (cadence); " + pendingSummary(tiers)
 			return
 		}
+	}
+	if tiers[1].pending >= adaptive {
+		d.ShouldInject = true
+		d.Tier = 1
+		d.Reason = fmt.Sprintf("growth: tier 1 has %d pending (>= %d); %s", tiers[1].pending, adaptive, pendingSummary(tiers))
+		return
 	}
 	d.Reason = "growth ready but no tier qualifies; " + pendingSummary(tiers)
 }

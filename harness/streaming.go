@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"sync"
 
 	"github.com/Autumn-27/norma/llm"
@@ -14,10 +15,12 @@ import (
 // blocks every tool queued behind it until it finishes. Results are yielded in
 // arrival order; progress is yielded as soon as it arrives.
 type streamExec struct {
-	l      *loop
-	mu     sync.Mutex
-	tools  []*tracked
-	notify chan struct{} // pinged when a tool completes or emits progress
+	l        *loop
+	ctx      context.Context
+	settling bool
+	mu       sync.Mutex
+	tools    []*tracked
+	notify   chan struct{} // pinged when a tool completes or emits progress
 }
 
 type toolStatus int
@@ -39,7 +42,7 @@ type tracked struct {
 }
 
 func newStreamExec(l *loop) *streamExec {
-	return &streamExec{l: l, notify: make(chan struct{}, 1)}
+	return &streamExec{l: l, ctx: l.toolCtx, settling: l.settling, notify: make(chan struct{}, 1)}
 }
 
 func (e *streamExec) ping() {
@@ -94,9 +97,13 @@ func (e *streamExec) processQueue() {
 }
 
 func (e *streamExec) run(t *tracked) {
-	e.l.sem <- struct{}{} // bound concurrent tool execution
+	select {
+	case <-e.ctx.Done():
+		return
+	case e.l.sem <- struct{}{}:
+	}
 	defer func() { <-e.l.sem }()
-	res, extra := e.l.execOne(t.block, func(p tool.ProgressInfo) {
+	res, extra := e.l.execOne(e.ctx, e.settling, t.block, func(p tool.ProgressInfo) {
 		e.mu.Lock()
 		t.prog = append(t.prog, p.Message)
 		e.mu.Unlock()
@@ -167,7 +174,7 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		// run's own MaxDuration deadline firing on an in-flight tool. Either way we
 		// synthesize interrupted results and report aborted; the turn loop then decides
 		// (parent-cancel → abort, budget-only → wrap-up) via ctx vs toolCtx.
-		if e.l.toolCtx.Err() != nil {
+		if e.ctx.Err() != nil {
 			return !e.drainSynthetic("tool execution interrupted"), true
 		}
 		if !e.pending() {
@@ -178,7 +185,7 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		}
 		select {
 		case <-e.notify:
-		case <-e.l.toolCtx.Done():
+		case <-e.ctx.Done():
 		}
 	}
 }

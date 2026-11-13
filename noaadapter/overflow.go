@@ -61,7 +61,7 @@ func (o *overflowState) learn(window int) {
 var windowPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)maximum context length is (\d+)`),
 	regexp.MustCompile(`(?i)context (?:window|length) (?:of|is) (\d+)`),
-	regexp.MustCompile(`(?i)max(?:imum)?[ _-]?tokens?[^0-9]{0,20}(\d{4,})`),
+	regexp.MustCompile(`(?i)prompt is too long:\s*\d+ tokens?\s*>\s*(\d+) maximum`),
 	regexp.MustCompile(`(?i)limit(?:ed)? to (\d{4,}) tokens`),
 }
 

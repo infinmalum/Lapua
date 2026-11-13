@@ -204,7 +204,7 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 
 	view := res.Messages
 	s.nudgedLastTurn = false
-	if res.Nudge != nil && s.nudgeAllowed(tokens) {
+	if res.Nudge != nil && s.nudgeAllowed(tokens, res.Nudge.Breakdown.Emergency, cfg) {
 		voice, text := noa.RenderNudgeText(*res.Nudge, noa.NudgeSections{})
 		_ = voice
 		view = append(view, noa.CoreMessage{
@@ -229,14 +229,16 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 //
 // Suppression is not permanent. It lifts once the context has grown by a full
 // cadence step, because by then the situation genuinely differs from the one
-// the model declined to act on. Without that release the first three failures
-// in a session would silence nudging for good. Callers hold the lock.
-func (s *Session) nudgeAllowed(tokenCount int) bool {
+// the model declined to act on. Entering the emergency band also resets the
+// ladder once. A model that keeps ignoring nudges in that band remains subject
+// to the cadence. Callers hold the lock.
+func (s *Session) nudgeAllowed(tokenCount int, emergency bool, cfg noa.Config) bool {
 	if s.attempts < s.cfg.MaxCompressAttempts {
 		return true
 	}
-	floor := noa.NudgeGrowthFloor(s.cfg)
-	if tokenCount-s.suppressedAtTokens >= floor {
+	floor := noa.NudgeGrowthFloor(cfg)
+	emergencyAt := int(float64(cfg.ModelContextLimit) * cfg.Nudge.EmergencyThresholdPct)
+	if tokenCount-s.suppressedAtTokens >= floor || (emergency && s.suppressedAtTokens < emergencyAt) {
 		s.attempts = 0
 		s.suppressedAtTokens = 0
 		return true

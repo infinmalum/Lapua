@@ -67,5 +67,5 @@ func runLS(_ context.Context, input json.RawMessage, tc *ToolContext) (Result, e
 		}
 		fmt.Fprintf(&b, "%s\t%d bytes\n", e.Name(), size)
 	}
-	return Text(Capture(tc, b.String())), nil
+	return CapResult(tc, Text(b.String())), nil
 }

@@ -172,5 +172,5 @@ func runWithRipgrep(rg string, r ripgrepReq, tc *ToolContext) (Result, bool) {
 	if more > 0 {
 		res += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, r.offset+len(kept))
 	}
-	return Text(Capture(tc, res)), true
+	return CapResult(tc, Text(res)), true
 }

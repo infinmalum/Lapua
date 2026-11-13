@@ -3,6 +3,7 @@ package transcript
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Autumn-27/norma/llm"
@@ -180,4 +181,39 @@ func appendRaw(path, line string) error {
 	defer f.Close()
 	_, err = f.WriteString(line)
 	return err
+}
+
+func TestAppendRecoversPartialTailAndPreservesOriginal(t *testing.T) {
+	store := NewStore(t.TempDir())
+	w := store.NewWriter("session", "")
+	w.RecordMessage(llm.UserText("first"), llm.Usage{})
+	path := store.MainPath("session")
+	if err := appendRaw(path, `{"uuid":"unfinished`); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := store.Load(path)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("recoverable prefix: records=%d err=%v", len(recs), err)
+	}
+	next := store.ResumeWriter("session", LastUUID(recs))
+	next.RecordMessage(llm.UserText("second"), llm.Usage{})
+	if err := next.Err(); err != nil {
+		t.Fatal(err)
+	}
+	recs, err = store.Load(path)
+	if err != nil || len(recs) != 2 || recs[1].ParentUUID != recs[0].UUID {
+		t.Fatalf("resumed log: records=%d err=%v", len(recs), err)
+	}
+	backups, err := filepath.Glob(path + ".recovery-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("original backup: %v err=%v", backups, err)
+	}
+	backup, err := os.ReadFile(backups[0])
+	if err != nil || string(backup) != string(original) {
+		t.Fatalf("original bytes were not preserved: %v", err)
+	}
 }

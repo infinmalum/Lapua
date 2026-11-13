@@ -52,7 +52,7 @@ func TestSuppressionReleaseFitsInsideTheWindow(t *testing.T) {
 // The emergency band exists because at that pressure the next request may not
 // fit at all. One nudge costs a couple of thousand tokens; an overflow costs the
 // turn. So the failure ladder must not be able to silence the emergency voice.
-func TestEmergencyPressureIsNudgedEvenWhenSuppressed(t *testing.T) {
+func TestEmergencyPressureIsNudged(t *testing.T) {
 	cfg := DefaultConfig(40_000)
 	// 96% of the window: past EmergencyThresholdPct.
 	tokens := int(float64(cfg.ModelContextLimit) * 0.96)
@@ -74,9 +74,4 @@ func TestEmergencyPressureIsNudgedEvenWhenSuppressed(t *testing.T) {
 		t.Fatalf("the decision at 96%% pressure is not flagged emergency: %+v", d.Breakdown)
 	}
 
-	// The host-side gate is what suppression acts on. It is a separate decision
-	// from DecideNudge, and it currently has no knowledge of pressure at all —
-	// see Session.nudgeAllowed, which branches only on attempts and growth.
-	// This test documents the seam; the assertion belongs with the host, in
-	// noaadapter.TestSuppressionSurvivesIntoTheEmergencyBand.
 }

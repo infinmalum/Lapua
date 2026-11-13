@@ -51,8 +51,26 @@ func TestAskReachesCallback(t *testing.T) {
 	}
 }
 
-func TestAllowRuleMatchesParenForm(t *testing.T) {
-	if b := eval(Request{ToolName: "Bash", Ctx: Context{Mode: ModeDefault, Allowed: []string{"Bash(git:*)"}}}); b != Allow {
-		t.Fatalf("paren allow rule should match tool name, got %v", b)
+func TestUnsupportedSelectorFailsClosed(t *testing.T) {
+	req := Request{ToolName: "Bash", Input: json.RawMessage(`{"command":"echo test"}`),
+		Ctx: Context{Mode: ModeBypass, Allowed: []string{"Bash(git:*)"}}}
+	if b := eval(req); b != Deny {
+		t.Fatalf("unsupported selector must not grant access: %v", b)
+	}
+	req.Ctx.Allowed = []string{"Bash"}
+	if b := eval(req); b != Allow {
+		t.Fatalf("bare tool name must still match: %v", b)
+	}
+}
+
+func TestNestedPolicyCannotLoosenParent(t *testing.T) {
+	req := Request{ToolName: "Write", Ctx: Context{Mode: ModeBypass}}
+	ctx := WithParentPolicy(t.Context(), Context{Mode: ModeDontAsk}, nil)
+	if d := Evaluate(ctx, req); d.Behavior != Deny {
+		t.Fatalf("child bypass loosened parent policy: %+v", d)
+	}
+	ctx = WithParentPolicy(t.Context(), Context{Mode: ModeBypass, Disallowed: []string{"Write"}}, nil)
+	if d := Evaluate(ctx, req); d.Behavior != Deny {
+		t.Fatalf("child bypass overrode explicit parent denial: %+v", d)
 	}
 }

@@ -8,6 +8,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -47,6 +48,12 @@ type ToolContext struct {
 	// DEBIAN_FRONTEND — see tool.nonInteractiveEnv), which override any value
 	// inherited for those four keys. Naming one here is how a host takes it back.
 	Env []string
+
+	// DispatchDeferred invokes a resolved deferred target through the current query.
+	// The harness supplies it only for ExecuteExtraTool.
+	DispatchDeferred func(name string, input json.RawMessage) Result
+	// DeferredTools lists targets whose direct calls are gated in the enclosing query.
+	DeferredTools []string
 }
 
 func (tc *ToolContext) progress(msg string) {
@@ -58,8 +65,9 @@ func (tc *ToolContext) progress(msg string) {
 // Result is the outcome of a tool call. Content is the tool_result payload fed
 // back to the model.
 type Result struct {
-	Content []llm.ContentBlock
-	IsError bool
+	cappedAt int // set by the capture path, never inferred from text
+	Content  []llm.ContentBlock
+	IsError  bool
 	// Extra holds additional messages the tool injects into the conversation
 	// right after its tool_result (e.g. the Skill tool emits the invoked skill's
 	// instructions as an independent user message rather than burying them in the
@@ -77,13 +85,13 @@ func Errorf(s string) Result {
 
 // Flatten concatenates the text of a result's content blocks.
 func (r Result) Flatten() string {
-	var s string
+	var s strings.Builder
 	for _, b := range r.Content {
 		if b.Type == llm.BlockText {
-			s += b.Text
+			s.WriteString(b.Text)
 		}
 	}
-	return s
+	return s.String()
 }
 
 // CoreTool is a capability the agent can invoke (FR-04.1).
