@@ -457,7 +457,10 @@ func (l *loop) run() {
 			if l.handleMaxOutputTokens() {
 				continue
 			}
-			// recovery exhausted: surface the truncated turn as completion.
+			if !l.settling {
+				l.finish(ReasonOutputLimit, nil, asst.Text())
+				return
+			}
 		} else {
 			l.maxOutputTokensOverride = 0
 		}
@@ -763,10 +766,6 @@ func messageHasToolUse(m llm.Message, name string) bool {
 	return false
 }
 
-// streamAndExecute runs one model completion, surfacing text/thinking, and feeds
-// tool_use blocks to the streaming executor as they finish — so tools begin
-// running while the rest of the message is still arriving. It returns the
-// assembled assistant message, the executor, the stop reason, and flags.
 // requestMessages builds the message array for one model request. A Compactor
 // that implements ContextView takes over the projection entirely; otherwise the
 // default working set (post-boundary, unpaired tool blocks dropped) is used.
@@ -778,6 +777,8 @@ func (l *loop) requestMessages() []llm.Message {
 	return llm.MessagesForAPI(l.messages)
 }
 
+// streamAndExecute forwards text and thinking as they arrive and dispatches
+// assembled tool calls after the model finishes the turn.
 func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	l.maybeInjectTodoReminder()
 	msgs := l.requestMessages()
@@ -798,50 +799,12 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	exec = newStreamExec(l)
 	acc := llm.NewAccumulator()
 
-	var building bool
-	var curID, curName string
-	var curInput strings.Builder
-	finalizeTool := func() bool { // false = consumer stopped
-		if !building {
-			return true
+	for ev, streamErr := range l.deps.CallModel(l.ctx, req) {
+		if streamErr != nil {
+			l.usage.Add(acc.Usage)
+			return asst, exec, acc.StopReason, streamErr, false, false
 		}
-		building = false
-		raw := strings.TrimSpace(curInput.String())
-		curInput.Reset()
-		if raw == "" || !jsonValid(raw) {
-			raw = "{}"
-		}
-		block := llm.ContentBlock{Type: llm.BlockToolUse, ID: curID, Name: curName, Input: []byte(raw)}
-		if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
-			return false
-		}
-		exec.add(block)
-		return exec.drain()
-	}
-
-	for ev, e := range l.deps.CallModel(l.ctx, req) {
-		if e != nil {
-			err = e
-			break
-		}
-		// Events that belong INSIDE a tool_use block must not reach
-		// finalizeTool below — that dispatches the tool and clears `building`,
-		// so any argument delta still to come would be dropped on the floor
-		// (curInput.WriteString is gated on `building`) and the tool would run
-		// with raw == "{}" while acc.Message() records the real arguments.
-		// SEToolUseSignature trails the arguments in Gemini's current framing,
-		// but a gateway is free to attach extra_content to the chunk that only
-		// declares id/name — so route it to the accumulator, not the boundary.
-		if ev.Type == llm.SEToolInputJSON || ev.Type == llm.SEToolUseSignature {
-			if building && ev.Type == llm.SEToolInputJSON {
-				curInput.WriteString(ev.Text)
-			}
-			acc.Add(ev)
-			continue
-		}
-		if !finalizeTool() {
-			return asst, exec, "", nil, true, false
-		}
+		acc.Add(ev)
 		switch ev.Type {
 		case llm.SETextDelta:
 			if ev.Text != "" && !l.emit(Event{Kind: KindText, Text: ev.Text}) {
@@ -851,26 +814,21 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			if ev.Text != "" && !l.emit(Event{Kind: KindThinking, Text: ev.Text}) {
 				return asst, exec, "", nil, true, false
 			}
-		case llm.SEToolUseStart:
-			curID, curName, building = ev.ToolID, ev.ToolName, true
 		}
-		acc.Add(ev)
-	}
-	if !finalizeTool() {
-		return asst, exec, "", nil, true, false
 	}
 	l.usage.Add(acc.Usage)
 	asst = acc.Message()
 	stopReason = acc.StopReason
-	if err != nil {
-		return asst, exec, stopReason, err, false, false
+	// Only dispatch calls from a successfully received model turn. Use the
+	// original arguments for validation and keep the replay message valid JSON.
+	uses := asst.ToolUses()
+	for i := range uses {
+		if raw := acc.ToolInput(i); len(raw) != 0 || acceptsRawInputFor(l.in.Tools, uses[i].Name) {
+			uses[i].Input = raw
+		}
 	}
-	// Drain tools to completion (or synthesize on abort).
-	cs, ab := exec.finish()
-	if cs {
-		return asst, exec, stopReason, nil, true, false
-	}
-	return asst, exec, stopReason, nil, false, ab
+	cs, ab := l.executeToolCalls(exec, uses)
+	return asst, exec, stopReason, nil, cs, ab
 }
 
 // completeAndExecute is the non-streaming counterpart of streamAndExecute's body.
@@ -899,53 +857,22 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 			if b.Text != "" && !l.emit(Event{Kind: KindText, Text: b.Text}) {
 				return asst, exec, stopReason, nil, true, false
 			}
-		case llm.BlockToolUse:
-			block := b
-			if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
-				return asst, exec, stopReason, nil, true, false
-			}
-			exec.add(block)
-			if !exec.drain() { // surface any results ready so far (FIFO)
-				return asst, exec, stopReason, nil, true, false
-			}
 		}
 	}
-	// Drain tools to completion (or synthesize on abort).
-	cs, ab := exec.finish()
-	if cs {
-		return asst, exec, stopReason, nil, true, false
-	}
-	return asst, exec, stopReason, nil, false, ab
+	cs, ab := l.executeToolCalls(exec, msg.ToolUses())
+	return asst, exec, stopReason, nil, cs, ab
 }
 
-func jsonValid(s string) bool {
-	// minimal check used only to guard tool input assembly
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for _, r := range s {
-		if inStr {
-			if esc {
-				esc = false
-			} else if r == '\\' {
-				esc = true
-			} else if r == '"' {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '"':
-			inStr = true
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
+// Publish the entire call batch before starting any tool. A host that stops on
+// KindToolUse therefore cannot leave part of this batch running.
+func (l *loop) executeToolCalls(exec *streamExec, uses []llm.ContentBlock) (consumerStopped, aborted bool) {
+	for _, block := range uses {
+		if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
+			return true, false
 		}
 	}
-	return depth == 0 && !inStr
+	for _, block := range uses {
+		exec.add(block)
+	}
+	return exec.finish()
 }

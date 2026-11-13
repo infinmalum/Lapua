@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -312,5 +313,51 @@ func TestMergeAdjacentSameRoleAfterDrop(t *testing.T) {
 	}
 	if merged[1].Role != RoleUser || len(merged[1].Content) != 2 {
 		t.Fatalf("user turns not coalesced: %+v", merged[1])
+	}
+}
+
+func TestBuiltInStreamsRejectPrematureEOF(t *testing.T) {
+	for format, frame := range map[Format]string{
+		FormatAnthropic:       `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"Read"}}`,
+		FormatOpenAI:          `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"Read","arguments":"{}"}}]}}]}`,
+		FormatOpenAIResponses: `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"a","name":"Read"}}`,
+	} {
+		t.Run(string(format), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, frame+"\n\n")
+			}))
+			defer server.Close()
+			p, err := NewProvider(Config{Format: format, BaseURL: server.URL, Model: "fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, err = range p.Stream(t.Context(), CompletionRequest{}) {
+				if err != nil {
+					break
+				}
+			}
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("err=%v, want unexpected EOF", err)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsInterleavesArgumentsByIndex(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, sse(
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"Read","arguments":"{\"file_path\":"}},{"index":1,"id":"b","function":{"name":"Read","arguments":"{\"file_path\":\"b\"}"}}]}}]}`, "",
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":"tool_calls"}]}`, "",
+			"data: [DONE]", "",
+		))
+	}))
+	defer server.Close()
+	p, err := NewProvider(Config{Format: FormatOpenAI, BaseURL: server.URL, Model: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uses := collect(t, p, CompletionRequest{}).ToolUses()
+	if len(uses) != 2 || string(uses[0].Input) != `{"file_path":"a"}` || string(uses[1].Input) != `{"file_path":"b"}` {
+		t.Fatalf("tool uses=%+v", uses)
 	}
 }

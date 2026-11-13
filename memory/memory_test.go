@@ -62,3 +62,40 @@ func TestMemoryTools(t *testing.T) {
 		t.Fatalf("recall: %q", res.Flatten())
 	}
 }
+
+func TestSaveKeepsCollidingNamesAndLegacyRecords(t *testing.T) {
+	store := NewStore(t.TempDir())
+	for _, m := range []Memory{{Name: "发布约定", Content: "old"}, {Name: "Build Options", Content: "old build"}} {
+		if err := os.WriteFile(filepath.Join(store.Dir, slug(m.Name)+".md"), []byte(renderFrontmatter(m)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := map[string]string{
+		"发布约定":            "update legacy record",
+		"编码习惯":            "new Chinese record",
+		"Build Options":   "update legacy build",
+		"Build / Options": "distinct colliding record",
+	}
+	for name, content := range want {
+		if err := store.Save(Memory{Name: name, Content: content}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	memories, err := store.Scan()
+	if err != nil || len(memories) != len(want) {
+		t.Fatalf("scan=%+v err=%v", memories, err)
+	}
+	for name, content := range want {
+		got, err := store.Read(name)
+		if err != nil || got.Name != name || strings.TrimSpace(got.Content) != content {
+			t.Fatalf("read %q: %+v err=%v", name, got, err)
+		}
+		if !strings.Contains(store.Index(), filepath.Base(got.Path)) {
+			t.Fatalf("index missing %s", got.Path)
+		}
+	}
+	legacy, err := store.Read("build-options")
+	if err != nil || legacy.Name != "Build Options" {
+		t.Fatalf("legacy slug lookup=%+v err=%v", legacy, err)
+	}
+}

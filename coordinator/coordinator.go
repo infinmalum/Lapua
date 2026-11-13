@@ -39,13 +39,19 @@ type Config struct {
 	MaxTurns       int // per-worker turn cap
 	MaxDepth       int // subagent recursion cap (default 3)
 	MaxParallel    int // bounded concurrency for RunParallel (default 4)
-	CanUseTool     permission.CanUseTool
-	Hooks          harness.HookRunner
+	// ConcurrentDelegation opts read-only Agent calls into the harness's
+	// concurrent scheduler. The worker provider, tools and hooks must be safe.
+	ConcurrentDelegation bool
+	CanUseTool           permission.CanUseTool
+	Hooks                harness.HookRunner
 }
 
 func (c *Config) workerPrompt() []string {
 	if len(c.WorkerPrompt) > 0 {
 		return c.WorkerPrompt
+	}
+	if c.mode() == permission.ModePlan {
+		return []string{"You are a read-only worker. Investigate the assigned task using the available tools, then report your findings to the coordinator."}
 	}
 	return []string{DefaultWorkerPrompt}
 }
@@ -70,6 +76,7 @@ func (c *Config) subagentConfig() subagent.Config {
 				Description:    "Executes a research, implementation, or verification task autonomously and reports back.",
 				Prompt:         c.workerPrompt(),
 				PermissionMode: c.mode(),
+				Concurrent:     c.ConcurrentDelegation,
 				MaxTurns:       c.MaxTurns,
 			},
 		},
@@ -116,8 +123,16 @@ func (c *Config) RunParallel(ctx context.Context, tasks []string) []Result {
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for i, task := range tasks {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			for j, pending := range tasks[i:] {
+				results[i+j] = Result{Task: pending, Err: ctx.Err()}
+			}
+			wg.Wait()
+			return results
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, task string) {
 			defer wg.Done()
 			defer func() { <-sem }()

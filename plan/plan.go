@@ -9,6 +9,7 @@ package plan
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 
 	"github.com/infinmalum/Lapua/permission"
@@ -124,10 +125,15 @@ func ExitTool(c *Controller, approve Approver) tool.CoreTool {
 			if !c.InPlan() {
 				return tool.Text("Not currently in plan mode; proceeding with implementation."), nil
 			}
-			approved := true
-			feedback := ""
-			if approve != nil {
-				approved, feedback = approve(ctx, in.Plan)
+			if strings.TrimSpace(in.Plan) == "" {
+				return tool.Errorf("Provide a non-empty plan for approval."), nil
+			}
+			if approve == nil {
+				return tool.Errorf("Plan approval is unavailable. Remaining in plan mode."), nil
+			}
+			approved, feedback := approve(ctx, in.Plan)
+			if err := ctx.Err(); err != nil {
+				return tool.Result{}, err
 			}
 			if approved {
 				c.approve()

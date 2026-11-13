@@ -127,6 +127,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 		for {
 			_, data, serr := scan.next()
 			if serr == io.EOF {
+				yield(StreamEvent{}, fmt.Errorf("anthropic: %w", io.ErrUnexpectedEOF))
 				return
 			}
 			if serr != nil {
@@ -144,7 +145,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			if !ok {
 				continue
 			}
-			if !yield(ev, nil) {
+			if !yield(ev, nil) || ev.Type == SEMessageStop {
 				return
 			}
 		}
@@ -235,6 +236,7 @@ func parseAnthropicResponse(raw []byte) (Message, string, Usage, error) {
 func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	var f struct {
 		Type         string `json:"type"`
+		Index        *int   `json:"index"`
 		ContentBlock struct {
 			Type string `json:"type"`
 			ID   string `json:"id"`
@@ -259,6 +261,10 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	if err := json.Unmarshal([]byte(data), &f); err != nil {
 		return StreamEvent{}, false, nil // tolerate non-JSON keepalives
 	}
+	index := 0
+	if f.Index != nil {
+		index = *f.Index
+	}
 	switch f.Type {
 	case "message_start":
 		if f.Message.Usage != nil {
@@ -279,7 +285,7 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 		}
 	case "content_block_start":
 		if f.ContentBlock.Type == "tool_use" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name, ToolIndex: index}, true, nil
 		}
 	case "content_block_delta":
 		switch f.Delta.Type {
@@ -290,7 +296,7 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 		case "signature_delta":
 			return StreamEvent{Type: SEThinkingSignature, Text: f.Delta.Signature}, true, nil
 		case "input_json_delta":
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON, ToolIndex: index, HasToolIndex: f.Index != nil}, true, nil
 		}
 	case "message_delta":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: f.Delta.StopReason}

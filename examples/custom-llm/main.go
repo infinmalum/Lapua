@@ -65,9 +65,10 @@ func main() {
 	sess := agentcore.NewSession(agentcore.Options{
 		Provider: prov,
 		// Fully custom, non-coding system prompt — the SDK adds nothing.
-		SystemPrompt:   []string{"You are a friendly math tutor. Use the `add` tool for any addition instead of computing it yourself, then explain the result in one sentence."},
-		Tools:          []tool.CoreTool{addTool()},
-		PermissionMode: permission.ModeBypass,
+		SystemPrompt:           []string{"You are a friendly math tutor. Use the `add` tool for any addition instead of computing it yourself, then explain the result in one sentence."},
+		Tools:                  []tool.CoreTool{addTool()},
+		PermissionMode:         permission.ModeDefault,
+		DisableBackgroundTasks: true,
 	})
 
 	fmt.Printf("(model: %s)\n", model)
@@ -75,6 +76,12 @@ func main() {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
+		}
+		if ev.Kind == harness.KindResult {
+			if err := ev.Terminal.CompletionError(); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
 		}
 		if ev.Kind == harness.KindText {
 			fmt.Print(ev.Text)

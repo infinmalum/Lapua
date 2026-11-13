@@ -50,16 +50,23 @@ func main() {
 		SystemPrompt: []string{
 			"You are a security auditor. Review the codebase for injection, hardcoded secrets, unsafe deserialization, and authz gaps. You may only read — never modify. Delegate pin-pointing a finding to the `tracer` subagent. Produce a concise findings list with file:line references.",
 		},
-		Tools:          append(readTools, agentTool),
-		PermissionMode: permission.ModePlan, // read-only
-		WorkingDir:     wd,
-		MaxTurns:       40,
+		Tools:                  append(readTools, agentTool),
+		PermissionMode:         permission.ModePlan, // read-only
+		WorkingDir:             wd,
+		MaxTurns:               40,
+		DisableBackgroundTasks: true,
 	})
 
 	for ev, err := range sess.Prompt(context.Background(), "Audit this repository for security issues.") {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
+		}
+		if ev.Kind == harness.KindResult {
+			if err := ev.Terminal.CompletionError(); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
 		}
 		if ev.Kind == harness.KindText {
 			fmt.Print(ev.Text)

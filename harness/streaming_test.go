@@ -3,25 +3,19 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"iter"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/infinmalum/Lapua/llm"
 	"github.com/infinmalum/Lapua/permission"
 	"github.com/infinmalum/Lapua/tool"
 )
 
-// TestStreamingToolExecutionOverlapsStream proves FR-01.4: a read-only,
-// concurrency-safe tool begins executing as soon as its tool_use block finishes
-// streaming, while the rest of the assistant message is still being produced.
-//
-// The scripted model emits tool A, then tool B (whose start finalizes A and
-// dispatches it), then BLOCKS — refusing to finish the message until A has
-// actually run. If tools only ran after the stream completed, this would
-// deadlock; the test's timeout would then fire.
-func TestStreamingToolExecutionOverlapsStream(t *testing.T) {
+// Verify interleaved argument deltas are routed to the right call and no tool
+// starts until the model turn ends.
+func TestStreamCollectsToolCallsBeforeDispatch(t *testing.T) {
 	ran := make(chan string, 4)
 	probe := tool.Build(tool.Spec{
 		Name: "probe",
@@ -54,16 +48,13 @@ func TestStreamingToolExecutionOverlapsStream(t *testing.T) {
 				yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
 				return
 			}
-			yield(llm.StreamEvent{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "probe"}, nil)
-			yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `{"id":"a"}`}, nil)
-			// Starting B finalizes A, so A is dispatched and runs concurrently.
-			yield(llm.StreamEvent{Type: llm.SEToolUseStart, ToolID: "b", ToolName: "probe"}, nil)
-			yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `{"id":"b"}`}, nil)
-			// Refuse to finish the message until A has actually executed.
-			for v := range ran {
-				if v == "a" {
-					break
-				}
+			yield(llm.StreamEvent{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "probe", ToolIndex: 0}, nil)
+			yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `{"id":`, ToolIndex: 0, HasToolIndex: true}, nil)
+			yield(llm.StreamEvent{Type: llm.SEToolUseStart, ToolID: "b", ToolName: "probe", ToolIndex: 1}, nil)
+			yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `{"id":"b"}`, ToolIndex: 1, HasToolIndex: true}, nil)
+			yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `"a"}`, ToolIndex: 0, HasToolIndex: true}, nil)
+			if len(ran) != 0 {
+				t.Error("tool ran while the provider was still streaming")
 			}
 			yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "tool_use"}, nil)
 			yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
@@ -76,32 +67,51 @@ func TestStreamingToolExecutionOverlapsStream(t *testing.T) {
 		PermissionMode: permission.ModeBypass,
 	}
 
-	done := make(chan *Terminal, 1)
-	go func() {
-		var term *Terminal
-		for ev, err := range Query(context.Background(), in, QueryDeps{CallModel: callModel}) {
-			if err != nil {
-				t.Errorf("event err: %v", err)
-				break
-			}
-			if ev.Kind == KindResult {
-				term = ev.Terminal
-			}
-		}
-		done <- term
-	}()
+	term := drain(t, in, QueryDeps{CallModel: callModel})
+	if term.Reason != ReasonCompleted {
+		t.Fatalf("terminal=%+v", term)
+	}
+	results := term.Messages[2].Content
+	if len(results) != 2 || results[0].ToolUseID != "a" || results[1].ToolUseID != "b" {
+		t.Fatalf("results=%+v", results)
+	}
+	close(ran)
+	got := map[string]bool{}
+	for id := range ran {
+		got[id] = true
+	}
+	if len(got) != 2 || !got["a"] || !got["b"] {
+		t.Fatalf("executed arguments=%v", got)
+	}
+}
 
-	select {
-	case term := <-done:
-		if term == nil || term.Reason != ReasonCompleted {
-			t.Fatalf("terminal=%+v", term)
+func TestStreamErrorDoesNotDispatchTools(t *testing.T) {
+	dropped := errors.New("stream dropped")
+	var runs atomic.Int32
+	probe := tool.Build(tool.Spec{Name: "probe", Run: func(context.Context, json.RawMessage, *tool.ToolContext) (tool.Result, error) {
+		runs.Add(1)
+		return tool.Text("ran"), nil
+	}})
+	call := func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		return func(yield func(llm.StreamEvent, error) bool) {
+			for _, event := range toolTurn("a", "probe", "{}")[:2] {
+				if !yield(event, nil) {
+					return
+				}
+			}
+			yield(llm.StreamEvent{}, dropped)
 		}
-		// Both probes produced tool_results, paired in order.
-		results := term.Messages[2].Content
-		if len(results) != 2 || results[0].ToolUseID != "a" || results[1].ToolUseID != "b" {
-			t.Fatalf("results=%+v", results)
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(probe), PermissionMode: permission.ModeBypass}
+	for event, _ := range Query(t.Context(), in, QueryDeps{CallModel: call}) {
+		if event.Kind == KindToolUse || event.Kind == KindToolResult {
+			t.Fatalf("unexpected tool event: %+v", event)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("deadlock: tool did not execute during streaming (FR-01.4 regression)")
+		if event.Kind == KindResult && (!errors.Is(event.Terminal.Err, dropped) || len(event.Terminal.Messages) != 1) {
+			t.Fatalf("terminal=%+v", event.Terminal)
+		}
+	}
+	if runs.Load() != 0 {
+		t.Fatal("tool ran after a failed model turn")
 	}
 }

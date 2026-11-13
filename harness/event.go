@@ -6,7 +6,11 @@
 // of Events and threads context cancellation throughout.
 package harness
 
-import "github.com/infinmalum/Lapua/llm"
+import (
+	"fmt"
+
+	"github.com/infinmalum/Lapua/llm"
+)
 
 // EventKind classifies a loop Event.
 type EventKind string
@@ -45,6 +49,7 @@ const (
 	ReasonStopHookPrevented TerminalReason = "stop_hook_prevented" // a Stop hook blocked continuation
 	ReasonHookStopped       TerminalReason = "hook_stopped"        // a tool/hook stopped continuation
 	ReasonMaxTurns          TerminalReason = "max_turns"           // hit MaxTurns
+	ReasonOutputLimit       TerminalReason = "output_limit"        // output truncation recovery exhausted
 	ReasonTimeout           TerminalReason = "timeout"             // hit a wall-clock run budget (host-imposed)
 )
 
@@ -70,4 +75,21 @@ type Terminal struct {
 	Turns    int
 	Messages []llm.Message // full conversation snapshot (non-destructive: retains history)
 	Text     string        // the assistant's final text, for convenience
+}
+
+// IncompleteError is returned when a run stopped without a completed answer.
+// The terminal snapshot can still contain partial output and tool results.
+type IncompleteError struct{ Reason TerminalReason }
+
+func (e *IncompleteError) Error() string { return fmt.Sprintf("agent stopped: %s", e.Reason) }
+
+// CompletionError reports the model error or the reason a run stopped early.
+func (t Terminal) CompletionError() error {
+	if t.Err != nil {
+		return t.Err
+	}
+	if t.Reason != ReasonCompleted {
+		return &IncompleteError{Reason: t.Reason}
+	}
+	return nil
 }

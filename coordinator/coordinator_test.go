@@ -6,7 +6,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/infinmalum/Lapua/harness"
 	"github.com/infinmalum/Lapua/llm"
 	"github.com/infinmalum/Lapua/permission"
 	"github.com/infinmalum/Lapua/tool"
@@ -88,5 +90,67 @@ func TestAgentToolAndSystemSegment(t *testing.T) {
 	res, _ := at.Call(context.Background(), []byte(`{"agent_type":"worker","prompt":"find bugs"}`), &tool.ToolContext{})
 	if !strings.Contains(res.Flatten(), "find bugs") {
 		t.Fatalf("worker dispatch: %q", res.Flatten())
+	}
+}
+
+type parallelProvider struct {
+	echoProvider
+	started atomic.Int32
+	ready   chan struct{}
+}
+
+func (p *parallelProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		if p.started.Add(1) == 2 {
+			close(p.ready)
+		}
+		select {
+		case <-p.ready:
+		case <-ctx.Done():
+			yield(llm.StreamEvent{}, ctx.Err())
+			return
+		}
+		p.echoProvider.Stream(ctx, req)(yield)
+	}
+}
+
+func TestReadOnlyModelDelegationsOverlap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	worker := &parallelProvider{ready: make(chan struct{})}
+	cfg := &Config{Provider: worker, PermissionMode: permission.ModePlan, ConcurrentDelegation: true}
+	turn := 0
+	deps := harness.QueryDeps{CallModel: func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		turn++
+		return func(yield func(llm.StreamEvent, error) bool) {
+			if turn > 1 {
+				yield(llm.StreamEvent{Type: llm.SETextDelta, Text: "done"}, nil)
+				return
+			}
+			for _, task := range []string{"a", "b"} {
+				if !yield(llm.StreamEvent{Type: llm.SEToolUseStart, ToolID: task, ToolName: "Agent"}, nil) ||
+					!yield(llm.StreamEvent{Type: llm.SEToolInputJSON, Text: `{"agent_type":"worker","prompt":"` + task + `"}`}, nil) {
+					return
+				}
+			}
+			yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+		}
+	}}
+	var results int
+	for event, err := range harness.Query(ctx, harness.QueryInput{
+		Tools: tool.NewRegistry(cfg.AgentTool()), PermissionMode: permission.ModePlan, MaxConcurrency: 2,
+	}, deps) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.Kind == harness.KindToolResult {
+			if event.ToolResult.IsError {
+				t.Fatalf("worker failed: %+v", event.ToolResult)
+			}
+			results++
+		}
+	}
+	if results != 2 {
+		t.Fatalf("got %d worker results, want 2", results)
 	}
 }

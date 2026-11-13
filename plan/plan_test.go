@@ -47,3 +47,11 @@ func TestExitToolReject(t *testing.T) {
 		t.Fatalf("should stay in plan, mode=%v", c.Mode())
 	}
 }
+
+func TestExitToolRequiresApproval(t *testing.T) {
+	c := NewController(permission.ModePlan, permission.ModeAcceptEdits)
+	result, err := ExitTool(c, nil).Call(t.Context(), []byte(`{"plan":"write a report"}`), &tool.ToolContext{})
+	if err != nil || !result.IsError || !c.InPlan() {
+		t.Fatalf("exit without an approver: result=%+v err=%v mode=%v", result, err, c.Mode())
+	}
+}

@@ -26,6 +26,8 @@ func TestPlanModeGatesThenAllowsWrites(t *testing.T) {
 		toolTurn("p1", "ExitPlanMode", `{"plan":"write the file"}`),                       // approved → mode flips
 		toolTurn("w2", "Write", `{"file_path":"`+jsonEsc(target)+`","content":"second"}`), // now allowed
 		textTurn("done"),
+		toolTurn("w3", "Write", `{"file_path":"`+jsonEsc(target)+`","content":"third"}`),
+		textTurn("done"),
 	}
 	var n int
 	callModel := func(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
@@ -46,13 +48,14 @@ func TestPlanModeGatesThenAllowsWrites(t *testing.T) {
 		PermissionMode: permission.ModeDefault,
 		WorkingDir:     dir,
 		Plan: &PlanOptions{
-			StartInPlanMode: true,
-			Approver:        func(_ context.Context, _ string) (bool, string) { return true, "" },
-			TargetMode:      permission.ModeAcceptEdits,
+			PlanEachPrompt: true,
+			Approver:       func(_ context.Context, _ string) (bool, string) { return true, "" },
+			TargetMode:     permission.ModeAcceptEdits,
 		},
 		Deps: harness.QueryDeps{CallModel: callModel},
 	})
 
+	defer sess.Close()
 	var results []llm.ContentBlock
 	for ev, err := range sess.Prompt(context.Background(), "create the file") {
 		if err != nil {
@@ -73,6 +76,17 @@ func TestPlanModeGatesThenAllowsWrites(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(target); string(b) != "second" {
 		t.Fatalf("file content=%q, want %q", b, "second")
+	}
+	for ev, err := range sess.Prompt(t.Context(), "change it again") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.Kind == harness.KindToolResult && !ev.ToolResult.IsError {
+			t.Fatalf("new prompt inherited write approval: %+v", ev.ToolResult)
+		}
+	}
+	if b, _ := os.ReadFile(target); string(b) != "second" {
+		t.Fatalf("second prompt edited without a new approval: %q", b)
 	}
 }
 

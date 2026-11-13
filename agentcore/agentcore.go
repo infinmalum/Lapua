@@ -207,11 +207,14 @@ type Options struct {
 
 // PlanOptions configures plan mode.
 type PlanOptions struct {
-	// Approver decides whether a presented plan is accepted. Nil auto-approves.
+	// Approver decides whether a presented plan is accepted. Nil keeps plan mode active.
 	Approver plan.Approver
 	// StartInPlanMode begins the session read-only (the agent must ExitPlanMode
 	// to implement). If false, the agent enters plan mode itself via EnterPlanMode.
 	StartInPlanMode bool
+	// PlanEachPrompt re-enters plan mode for each new user prompt. Approving a
+	// plan enables implementation for the remainder of that prompt's run.
+	PlanEachPrompt bool
 	// TargetMode is the permission mode after approval (default acceptEdits).
 	TargetMode permission.Mode
 }
@@ -441,6 +444,9 @@ type hookFirer interface {
 // final event is KindResult; Session state is updated when the consumer reaches
 // it (FR-07.3).
 func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Event, error] {
+	if s.planCtrl != nil && s.opts.Plan.PlanEachPrompt {
+		s.planCtrl.Enter()
+	}
 	// Auto-inject memories relevant to this prompt (Phase 4).
 	if s.opts.Memory != nil && s.opts.Memory.AutoInject && s.opts.Memory.Store != nil {
 		max := s.opts.Memory.MaxInject
@@ -556,9 +562,7 @@ func Run(ctx context.Context, opts Options, input string) (string, error) {
 		}
 		if ev.Kind == harness.KindResult && ev.Terminal != nil {
 			text = ev.Terminal.Text
-			if ev.Terminal.Err != nil {
-				rerr = ev.Terminal.Err
-			}
+			rerr = ev.Terminal.CompletionError()
 		}
 	}
 	return text, rerr

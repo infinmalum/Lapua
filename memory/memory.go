@@ -6,6 +6,8 @@
 package memory
 
 import (
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,10 +79,24 @@ func (s *Store) Scan() ([]Memory, error) {
 	return out, nil
 }
 
-// Read returns the memory with the given name (or its slug).
+// Read resolves an exact name first and accepts the legacy slug as an alias.
 func (s *Store) Read(name string) (Memory, error) {
-	p := filepath.Join(s.Dir, slug(name)+".md")
-	return s.readFile(p)
+	name = strings.TrimSpace(name)
+	unique := filepath.Join(s.Dir, uniqueFilename(name))
+	m, err := s.readFile(unique)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return m, err
+	}
+	legacy := filepath.Join(s.Dir, slug(name)+".md")
+	m, err = s.readFile(legacy)
+	if err == nil && m.Name != name && name != slug(m.Name) {
+		return Memory{}, fmt.Errorf("memory %q: %w", name, os.ErrNotExist)
+	}
+	return m, err
+}
+
+func uniqueFilename(name string) string {
+	return fmt.Sprintf("memory_%x.md", sha256.Sum256([]byte(name)))
 }
 
 func (s *Store) readFile(path string) (Memory, error) {
@@ -99,36 +115,89 @@ func (s *Store) readFile(path string) (Memory, error) {
 	return m, nil
 }
 
-// Save writes a memory file and rebuilds the MEMORY.md index.
+// Save updates a memory by exact name and rebuilds the MEMORY.md index.
+// An existing legacy filename is reused only when it belongs to that name.
 func (s *Store) Save(m Memory) error {
+	m.Name = strings.TrimSpace(m.Name)
+	if m.Name == "" || strings.ContainsAny(m.Name, "\r\n") {
+		return fmt.Errorf("memory: a single-line name is required")
+	}
 	if err := s.ensure(); err != nil {
 		return err
 	}
-	if m.Name == "" {
-		return fmt.Errorf("memory: name is required")
+	unique := uniqueFilename(m.Name)
+	legacy := slug(m.Name)
+	filename := unique
+	if legacy != "" && len(legacy) <= 180 {
+		if _, err := os.Stat(filepath.Join(s.Dir, unique)); errors.Is(err, os.ErrNotExist) {
+			filename = legacy + ".md"
+		}
 	}
-	path := filepath.Join(s.Dir, slug(m.Name)+".md")
-	if err := os.WriteFile(path, []byte(renderFrontmatter(m)), 0o644); err != nil {
+	// Also reuse legacy .md for the single existing record stored there.
+	if legacy == "" {
+		if old, err := s.readFile(filepath.Join(s.Dir, ".md")); err == nil && old.Name == m.Name {
+			filename = ".md"
+		}
+	}
+	stage, err := s.stage(renderFrontmatter(m))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(stage)
+	path := filepath.Join(s.Dir, filename)
+	if filename == unique {
+		err = os.Rename(stage, path)
+	} else if err = os.Link(stage, path); errors.Is(err, os.ErrExist) {
+		old, readErr := s.readFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if old.Name != m.Name {
+			path = filepath.Join(s.Dir, unique)
+		}
+		err = os.Rename(stage, path)
+	}
+	if err != nil {
 		return err
 	}
 	return s.rebuildIndex()
 }
 
-// Index returns the MEMORY.md content (an index of memories), building it from a
-// scan if the file is absent.
-func (s *Store) Index() string {
-	if data, err := os.ReadFile(filepath.Join(s.Dir, indexFile)); err == nil {
-		return string(data)
+// stage creates a complete file in the destination directory so publishing it
+// with link or rename never exposes partial content.
+func (s *Store) stage(content string) (string, error) {
+	file, err := os.CreateTemp(s.Dir, ".memory-*")
+	if err != nil {
+		return "", err
 	}
-	return s.buildIndex()
+	_, writeErr := file.WriteString(content)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
+}
+
+// Index renders the current memories, including records saved by other sessions.
+func (s *Store) Index() string {
+	mems, _ := s.Scan()
+	return buildIndex(mems)
 }
 
 func (s *Store) rebuildIndex() error {
-	return os.WriteFile(filepath.Join(s.Dir, indexFile), []byte(s.buildIndex()), 0o644)
+	mems, err := s.Scan()
+	if err != nil {
+		return err
+	}
+	stage, err := s.stage(buildIndex(mems))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(stage)
+	return os.Rename(stage, filepath.Join(s.Dir, indexFile))
 }
 
-func (s *Store) buildIndex() string {
-	mems, _ := s.Scan()
+func buildIndex(mems []Memory) string {
 	var b strings.Builder
 	b.WriteString("# Memory\n\n")
 	if len(mems) == 0 {
@@ -136,7 +205,7 @@ func (s *Store) buildIndex() string {
 		return b.String()
 	}
 	for _, m := range mems {
-		fmt.Fprintf(&b, "- [%s](%s.md) — %s\n", m.Name, slug(m.Name), m.Description)
+		fmt.Fprintf(&b, "- [%s](%s) — %s\n", m.Name, filepath.Base(m.Path), m.Description)
 	}
 	return b.String()
 }

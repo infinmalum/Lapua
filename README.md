@@ -38,9 +38,16 @@ sess := agentcore.NewSession(agentcore.Options{
     CanUseTool:     myApprovalCallback, // gates mutating tools
 })
 
+defer sess.Close()
+
 for ev, err := range sess.Prompt(ctx, "Add a /health endpoint and run the tests.") {
-    if err != nil { /* ... */ }
-    if ev.Kind == harness.KindText { fmt.Print(ev.Text) }
+    if err != nil { return err }
+    switch ev.Kind {
+    case harness.KindText:
+        fmt.Print(ev.Text)
+    case harness.KindResult:
+        return ev.Terminal.CompletionError()
+    }
 }
 ```
 
@@ -73,6 +80,16 @@ Set `-base-url` in the CLI or `llm.Config.BaseURL` in the SDK for a compatible g
 
 Deferred tools omit their schemas from the model's tool list. The model can request their schemas through `SearchExtraTools` and invoke unlocked targets through `ExecuteExtraTool`. Both the wrapper and the target are checked. Child agents inherit the enclosing query's allow and deny rules and default permission mode. An explicitly configured child mode can further restrict calls.
 
+## Run completion and plan approval
+
+`Session.Prompt` streams text and reasoning as they arrive. Tool calls start after the model response finishes successfully. The harness assembles argument fragments by tool call and uses the same scheduling rules for streaming and non-streaming responses.
+
+Read `KindResult` to determine the outcome. `Terminal.CompletionError()` returns the provider error when present or a typed `*harness.IncompleteError` with the terminal reason when the run stops early. `agentcore.Run` and `subagent.Run` return this error with any available final text.
+
+Supply `PlanOptions.Approver` to authorize a transition out of read-only plan mode. With no approver, the session stays in plan mode. Set `PlanEachPrompt` to require a new approval for each user prompt. Supply `CanUseTool` separately for commands that still require individual approval.
+
+A subagent explicitly configured with `permission.ModePlan` can be delegated to from a read-only parent. Every child tool call still passes the enclosing permission policy. Set `coordinator.Config.ConcurrentDelegation` to opt read-only worker calls into concurrent scheduling when the worker provider, tools, and hooks support concurrent use. The parent query's concurrency limit applies to model-driven delegation. `RunParallel` uses `coordinator.Config.MaxParallel`. Workers share the configured working directory.
+
 ## Context and session state
 
 Use `agentcore.Options.Compaction` for the built-in automatic summarizer, or call `noaadapter.Enable` before creating the session to install model-driven compression. NOA requires a durable `ArchiveBaseDir`. Set `ModelContextLimit` to match the deployment. The adapter supplies its own request view and takes precedence over built-in compaction when both are configured.
@@ -84,7 +101,8 @@ Use `agentcore.Options.Compaction` for the built-in automatic summarizer, or cal
 - `examples/custom-llm` — three provider configs + a custom non-coding prompt + a custom tool.
 - `examples/coding-agent` — full coding agent with interactive permissions, a PreToolUse hook, and compaction.
 - `examples/security-audit` — read-only auditor that delegates to a subagent.
-- `examples/planner-memory` — plan mode (explore → approve → implement) plus persistent memory.
+- `examples/planner-memory` — per-prompt plan approval, separate tool approval, and persistent memory.
+- `examples/coordinator` — parallel read-only workers with host-driven and model-driven delegation.
 
 ## Tests
 

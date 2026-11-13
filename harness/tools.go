@@ -22,6 +22,14 @@ func acceptsRawInput(t tool.CoreTool) bool {
 	return ok && r.AcceptsRawInput()
 }
 
+func acceptsRawInputFor(reg *tool.Registry, name string) bool {
+	if reg == nil {
+		return false
+	}
+	t, ok := reg.Get(name)
+	return ok && acceptsRawInput(t)
+}
+
 // execOne preserves the model's tool-call ID, including for a deferred target.
 func (l *loop) execOne(ctx context.Context, settling bool, use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
 	res := l.runTool(ctx, settling, use, emitProgress, false)
@@ -35,6 +43,9 @@ func (l *loop) execOne(ctx context.Context, settling bool, use llm.ContentBlock,
 func (l *loop) runTool(ctx context.Context, settling bool, use llm.ContentBlock, emitProgress func(tool.ProgressInfo), deferred bool) tool.Result {
 	if err := ctx.Err(); err != nil {
 		return tool.Errorf(err.Error())
+	}
+	if l.in.Tools == nil {
+		return tool.Errorf(fmt.Sprintf("Error: unknown tool %q", use.Name))
 	}
 	t, ok := l.in.Tools.Get(use.Name)
 	if !ok {
@@ -50,6 +61,9 @@ func (l *loop) runTool(ctx context.Context, settling bool, use llm.ContentBlock,
 	safe := t.IsConcurrencySafe(input)
 	validate := func(input json.RawMessage) error {
 		if !acceptsRawInput(t) {
+			if len(input) > 0 && !json.Valid(input) {
+				return fmt.Errorf("input is not valid JSON")
+			}
 			if err := tool.ValidateInput(t.InputSchema(), input); err != nil {
 				return err
 			}

@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,16 +33,29 @@ func main() {
 	// Memory persisted under the working directory.
 	store := memory.NewStore(filepath.Join(wd, ".agent-memory"))
 
+	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sess := agentcore.NewSession(agentcore.Options{
 		Provider:     prov,
 		SystemPrompt: []string{"You are a coding agent. Plan before you build; record durable facts (preferences, project constraints) to memory."},
 		WorkingDir:   wd,
 		MaxTurns:     50,
+		CanUseTool: func(_ context.Context, name string, input json.RawMessage, _ permission.Context) permission.Decision {
+			fmt.Printf("\nAllow %s %s? [y/N] ", name, input)
+			if in.Scan() {
+				if answer := strings.ToLower(strings.TrimSpace(in.Text())); answer == "y" || answer == "yes" {
+					return permission.Allowed()
+				}
+			}
+			return permission.Denied("denied by user")
+		},
 		// Plan mode: start read-only; ask the terminal to approve the plan.
 		Plan: &agentcore.PlanOptions{
-			StartInPlanMode: true,
-			TargetMode:      permission.ModeAcceptEdits,
-			Approver:        approvePlan,
+			PlanEachPrompt: true,
+			TargetMode:     permission.ModeAcceptEdits,
+			Approver: func(_ context.Context, plan string) (bool, string) {
+				return approvePlan(in, plan)
+			},
 		},
 		// Memory: inject relevant memories per prompt and expose the index.
 		Memory: &agentcore.MemoryOptions{
@@ -52,7 +66,7 @@ func main() {
 	})
 
 	fmt.Printf("planner-memory (%s) — plan mode + memory. Ctrl-D to quit.\n", model)
-	in := bufio.NewScanner(os.Stdin)
+	defer sess.Close()
 	for {
 		fmt.Print("\n› ")
 		if !in.Scan() {
@@ -74,22 +88,28 @@ func main() {
 				fmt.Printf("\n· %s\n", ev.ToolUse.Name)
 			case harness.KindResult:
 				fmt.Println()
+				if err := ev.Terminal.CompletionError(); err != nil {
+					fmt.Fprintln(os.Stderr, "error:", err)
+				}
 			}
 		}
 	}
 }
 
 // approvePlan prints the plan and asks for terminal approval.
-func approvePlan(_ context.Context, plan string) (bool, string) {
+func approvePlan(in *bufio.Scanner, plan string) (bool, string) {
 	fmt.Printf("\n--- Proposed plan ---\n%s\n---------------------\nApprove this plan? [y/N] ", plan)
-	r := bufio.NewReader(os.Stdin)
-	line, _ := r.ReadString('\n')
-	if s := strings.ToLower(strings.TrimSpace(line)); s == "y" || s == "yes" {
+	if !in.Scan() {
+		return false, ""
+	}
+	if s := strings.ToLower(strings.TrimSpace(in.Text())); s == "y" || s == "yes" {
 		return true, ""
 	}
 	fmt.Print("Feedback (optional): ")
-	fb, _ := r.ReadString('\n')
-	return false, strings.TrimSpace(fb)
+	if in.Scan() {
+		return false, strings.TrimSpace(in.Text())
+	}
+	return false, ""
 }
 
 func envOr(k, def string) string {

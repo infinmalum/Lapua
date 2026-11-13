@@ -340,6 +340,7 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			emitted := false
 			consumerStopped := false
 			var streamErr error
+			finished := false
 			for {
 				_, data, serr := scan.next()
 				if serr == io.EOF {
@@ -354,6 +355,7 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					continue
 				}
 				if data == "[DONE]" {
+					finished = true
 					break
 				}
 				evs, sr, u, ok := parseOpenAIFrame(data, started)
@@ -391,6 +393,10 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					return
 				}
 				continue
+			}
+			if !finished && stopReason == "" {
+				yield(StreamEvent{}, fmt.Errorf("openai: %w", io.ErrUnexpectedEOF))
+				return
 			}
 			if !yield(StreamEvent{Type: SEMessageDelta, StopReason: stopReason, Usage: usage}, nil) {
 				return
@@ -599,7 +605,7 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name, ToolIndex: tc.Index})
 		}
 		if tc.Function.Arguments != "" {
-			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments})
+			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments, ToolIndex: tc.Index, HasToolIndex: true})
 		}
 		// Gemini attaches thought_signature to the delta that completes this
 		// tool call, after its arguments — mirrors how SEThinkingSignature

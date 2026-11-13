@@ -68,7 +68,7 @@ type Context struct {
 type CanUseTool func(ctx context.Context, toolName string, input json.RawMessage, pc Context) Decision
 
 // editTools are auto-allowed under ModeAcceptEdits.
-var editTools = map[string]bool{"Write": true, "Edit": true, "NotebookEdit": true}
+var editTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
 
 // Request bundles everything Evaluate needs without importing the tool package.
 type Request struct {

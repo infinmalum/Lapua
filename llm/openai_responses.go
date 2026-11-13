@@ -150,6 +150,7 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 		for {
 			event, data, serr := scan.next()
 			if serr == io.EOF {
+				yield(StreamEvent{}, fmt.Errorf("openai-responses: %w", io.ErrUnexpectedEOF))
 				return
 			}
 			if serr != nil {
@@ -167,7 +168,7 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 			if !ok {
 				continue
 			}
-			if !yield(ev, nil) {
+			if !yield(ev, nil) || ev.Type == SEMessageDelta && ev.StopReason != "" {
 				return
 			}
 		}
@@ -181,7 +182,8 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	// The event name is authoritative; some gateways omit the SSE `event:` line
 	// and put the discriminator only in the JSON `type` field, so fall back to it.
 	var f struct {
-		Type string `json:"type"`
+		Type        string `json:"type"`
+		OutputIndex *int   `json:"output_index"`
 		// output_item.added: item carries the function_call id/name.
 		Item struct {
 			Type      string `json:"type"`
@@ -208,10 +210,14 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	if kind == "" {
 		kind = f.Type
 	}
+	index := 0
+	if f.OutputIndex != nil {
+		index = *f.OutputIndex
+	}
 	switch kind {
 	case "response.output_item.added":
 		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name, ToolIndex: index}, true, nil
 		}
 	case "response.output_text.delta":
 		if f.Delta != "" {
@@ -223,7 +229,7 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		}
 	case "response.function_call_arguments.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta, ToolIndex: index, HasToolIndex: f.OutputIndex != nil}, true, nil
 		}
 	case "response.completed", "response.incomplete":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}

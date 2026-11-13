@@ -23,7 +23,10 @@ type Definition struct {
 	Prompt         []string        // the subagent's system prompt
 	Tools          []string        // tool names it may use (empty = inherit all)
 	PermissionMode permission.Mode // its permission mode (default: parent's)
-	MaxTurns       int
+	// Concurrent opts a read-only agent into parallel dispatch. Its provider,
+	// tools and hooks must support concurrent calls.
+	Concurrent bool
+	MaxTurns   int
 }
 
 // Config wires the Agent tool.
@@ -58,6 +61,17 @@ func NewTool(cfg Config) tool.CoreTool {
 	for n, d := range cfg.Agents {
 		names += fmt.Sprintf("\n- %s: %s", n, d.Description)
 	}
+	type agentInput struct {
+		AgentType string `json:"agent_type"`
+		Prompt    string `json:"prompt"`
+	}
+	definition := func(input json.RawMessage) Definition {
+		var in agentInput
+		if json.Unmarshal(input, &in) != nil {
+			return Definition{}
+		}
+		return cfg.Agents[in.AgentType]
+	}
 	return tool.Build(tool.Spec{
 		Name:        "Agent",
 		Description: "Delegates a self-contained sub-task to an isolated subagent that runs with its own prompt and tools, returning only its final answer. Use it to parallelize independent work or to keep large intermediate output out of the main context.",
@@ -70,14 +84,18 @@ func NewTool(cfg Config) tool.CoreTool {
 			},
 			"required": []any{"agent_type", "prompt"},
 		},
+		ReadOnly: func(input json.RawMessage) bool {
+			return definition(input).PermissionMode == permission.ModePlan
+		},
+		Concurrent: func(input json.RawMessage) bool {
+			def := definition(input)
+			return def.PermissionMode == permission.ModePlan && def.Concurrent
+		},
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.Allowed() // the subagent's own tool calls are gated internally
 		},
 		Run: func(ctx context.Context, input json.RawMessage, tc *tool.ToolContext) (tool.Result, error) {
-			var in struct {
-				AgentType string `json:"agent_type"`
-				Prompt    string `json:"prompt"`
-			}
+			var in agentInput
 			if err := json.Unmarshal(input, &in); err != nil {
 				return tool.Result{}, err
 			}
@@ -162,7 +180,7 @@ func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, wor
 		}
 		if ev.Kind == harness.KindResult && ev.Terminal != nil {
 			final = ev.Terminal.Text
-			rerr = ev.Terminal.Err
+			rerr = ev.Terminal.CompletionError()
 		}
 	}
 	return final, rerr

@@ -8,8 +8,7 @@ import (
 	"github.com/infinmalum/Lapua/tool"
 )
 
-// streamExec is the streaming tool executor: tool_use blocks are registered as
-// they finish streaming and begin executing immediately, subject to a FIFO +
+// streamExec executes tool calls from a completed model response, subject to a FIFO +
 // exclusivity rule — a concurrency-safe tool may run alongside other safe tools,
 // but a non-safe tool requires exclusive access (no other tool executing) and
 // blocks every tool queued behind it until it finishes. Results are yielded in
@@ -56,8 +55,10 @@ func (e *streamExec) ping() {
 func (e *streamExec) add(block llm.ContentBlock) {
 	e.mu.Lock()
 	safe := false
-	if t, ok := e.l.in.Tools.Get(block.Name); ok {
-		safe = t.IsConcurrencySafe(block.Input)
+	if e.l.in.Tools != nil {
+		if t, ok := e.l.in.Tools.Get(block.Name); ok {
+			safe = t.IsConcurrencySafe(block.Input)
+		}
 	}
 	e.tools = append(e.tools, &tracked{block: block, safe: safe})
 	e.mu.Unlock()

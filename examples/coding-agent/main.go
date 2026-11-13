@@ -5,7 +5,7 @@
 //
 // Flags:
 //
-//	-provider anthropic|openai  (default openai)
+//	-provider anthropic|openai|openai-responses  (default openai)
 //	-model    MODEL             (env AGENT_MODEL)
 //	-dir      DIR               working directory (default cwd)
 //	-yes                        auto-approve tool calls (for non-interactive runs)
@@ -32,7 +32,9 @@ import (
 	"github.com/infinmalum/Lapua/tool"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	providerName := flag.String("provider", envOr("AGENT_PROVIDER", "openai"), "anthropic | openai | openai-responses")
 	model := flag.String("model", envOr("AGENT_MODEL", ""), "model id")
 	dir := flag.String("dir", "", "working directory (default cwd)")
@@ -42,12 +44,12 @@ func main() {
 
 	if *model == "" {
 		fmt.Fprintln(os.Stderr, "error: -model is required")
-		os.Exit(2)
+		return 2
 	}
 	prov, err := llm.NewProvider(llm.Config{Format: llm.Format(*providerName), Model: *model})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 	wd := *dir
 	if wd == "" {
@@ -68,7 +70,11 @@ func main() {
 		wd, runtime.GOOS, time.Now().Format("2006-01-02"), *model)
 
 	mode := permission.ModeDefault
-	canUse := confirm
+	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	canUse := func(_ context.Context, name string, input json.RawMessage, _ permission.Context) permission.Decision {
+		return confirm(in, name, input)
+	}
 	if *yes {
 		mode = permission.ModeBypass
 		canUse = nil
@@ -87,8 +93,9 @@ func main() {
 		MaxTurns:       80,
 	})
 
+	defer sess.Close()
 	if *oneShot != "" {
-		runTurn(sess, *oneShot)
+		err := runTurn(sess, *oneShot)
 		if items := todos.List(); len(items) > 0 {
 			fmt.Fprintf(os.Stderr, "\n[todos: %d items, final plan]\n", len(items))
 			for _, td := range items {
@@ -96,19 +103,27 @@ func main() {
 			}
 		}
 		printUsage(sess)
-		return
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		return 0
 	}
 
 	fmt.Printf("coding-agent (%s). Type a request, Ctrl-D to quit.\n", *model)
-	in := bufio.NewScanner(os.Stdin)
-	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for {
 		fmt.Print("\n› ")
 		if !in.Scan() {
-			return
+			if err := in.Err(); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				return 1
+			}
+			return 0
 		}
 		if line := strings.TrimSpace(in.Text()); line != "" {
-			runTurn(sess, line)
+			if err := runTurn(sess, line); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+			}
 			printUsage(sess)
 		}
 	}
@@ -122,11 +137,10 @@ func printUsage(sess *agentcore.Session) {
 		u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.InputTokens+u.OutputTokens)
 }
 
-func runTurn(sess *agentcore.Session, input string) {
+func runTurn(sess *agentcore.Session, input string) error {
 	for ev, err := range sess.Prompt(context.Background(), input) {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[error: %v]\n", err)
-			return
+			return err
 		}
 		switch ev.Kind {
 		case harness.KindText:
@@ -139,8 +153,10 @@ func runTurn(sess *agentcore.Session, input string) {
 			}
 		case harness.KindResult:
 			fmt.Println()
+			return ev.Terminal.CompletionError()
 		}
 	}
+	return nil
 }
 
 func summarize(input json.RawMessage) string {
@@ -151,12 +167,12 @@ func summarize(input json.RawMessage) string {
 	return s
 }
 
-func confirm(_ context.Context, name string, input json.RawMessage, _ permission.Context) permission.Decision {
-	fmt.Printf("\nAllow %s %s ? [y/N] ", name, summarize(input))
-	r := bufio.NewReader(os.Stdin)
-	line, _ := r.ReadString('\n')
-	if s := strings.ToLower(strings.TrimSpace(line)); s == "y" || s == "yes" {
-		return permission.Allowed()
+func confirm(in *bufio.Scanner, name string, input json.RawMessage) permission.Decision {
+	fmt.Printf("\nAllow %s %s ? [y/N] ", name, input)
+	if in.Scan() {
+		if s := strings.ToLower(strings.TrimSpace(in.Text())); s == "y" || s == "yes" {
+			return permission.Allowed()
+		}
 	}
 	return permission.Denied("denied by user")
 }

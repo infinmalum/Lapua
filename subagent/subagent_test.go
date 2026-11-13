@@ -2,10 +2,13 @@ package subagent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"iter"
 	"strings"
 	"testing"
 
+	"github.com/infinmalum/Lapua/harness"
 	"github.com/infinmalum/Lapua/llm"
 	"github.com/infinmalum/Lapua/permission"
 	"github.com/infinmalum/Lapua/tool"
@@ -69,5 +72,83 @@ func TestRecursionDepthGuard(t *testing.T) {
 	res, _ := agentTool.Call(ctx, []byte(`{"agent_type":"a","prompt":"x"}`), &tool.ToolContext{})
 	if !res.IsError || !strings.Contains(res.Flatten(), "recursion depth") {
 		t.Fatalf("expected depth guard, got %q", res.Flatten())
+	}
+}
+
+type loopingProvider struct{ fakeProvider }
+
+func (loopingProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for _, event := range []llm.StreamEvent{
+			{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "Read"},
+			{Type: llm.SEToolInputJSON, Text: `{"file_path":"sample.txt"}`},
+			{Type: llm.SEMessageStop},
+		} {
+			if !yield(event, nil) {
+				return
+			}
+		}
+	}
+}
+
+func TestWorkerReportsTurnLimit(t *testing.T) {
+	_, err := Run(t.Context(), Config{
+		Provider: loopingProvider{},
+		Agents:   map[string]Definition{"worker": {MaxTurns: 1}},
+	}, "worker", "continue", t.TempDir())
+	var incomplete *harness.IncompleteError
+	if !errors.As(err, &incomplete) || incomplete.Reason != harness.ReasonMaxTurns {
+		t.Fatalf("err=%v, want max_turns", err)
+	}
+}
+
+func TestPlanModeDelegatesOnlyToReadOnlyAgents(t *testing.T) {
+	at := NewTool(Config{
+		Provider: fakeProvider{reply: "reviewed"},
+		Agents: map[string]Definition{
+			"reader": {PermissionMode: permission.ModePlan, Concurrent: true},
+			"editor": {PermissionMode: permission.ModeAcceptEdits, Concurrent: true},
+		},
+	})
+	input := func(agent string) json.RawMessage {
+		return json.RawMessage(`{"agent_type":"` + agent + `","prompt":"review"}`)
+	}
+	if !at.IsReadOnly(input("reader")) || !at.IsConcurrencySafe(input("reader")) {
+		t.Fatal("read-only worker should allow concurrent delegation")
+	}
+	if at.IsReadOnly(input("editor")) || at.IsConcurrencySafe(input("editor")) {
+		t.Fatal("editable worker should require exclusive dispatch and a non-plan parent")
+	}
+	turn := 0
+	deps := harness.QueryDeps{CallModel: func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		turn++
+		return func(yield func(llm.StreamEvent, error) bool) {
+			if turn == 1 {
+				for _, event := range []llm.StreamEvent{
+					{Type: llm.SEToolUseStart, ToolID: "r", ToolName: "Agent"},
+					{Type: llm.SEToolInputJSON, Text: string(input("reader"))},
+					{Type: llm.SEToolUseStart, ToolID: "w", ToolName: "Agent"},
+					{Type: llm.SEToolInputJSON, Text: string(input("editor"))},
+					{Type: llm.SEMessageStop},
+				} {
+					if !yield(event, nil) {
+						return
+					}
+				}
+				return
+			}
+			yield(llm.StreamEvent{Type: llm.SETextDelta, Text: "done"}, nil)
+		}
+	}}
+	results := map[string]llm.ContentBlock{}
+	for event, _ := range harness.Query(t.Context(), harness.QueryInput{
+		Tools: tool.NewRegistry(at), PermissionMode: permission.ModePlan,
+	}, deps) {
+		if event.Kind == harness.KindToolResult {
+			results[event.ToolResult.ToolUseID] = *event.ToolResult
+		}
+	}
+	if len(results) != 2 || results["r"].IsError || !results["w"].IsError {
+		t.Fatalf("results=%+v", results)
 	}
 }
