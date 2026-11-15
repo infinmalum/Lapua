@@ -76,15 +76,19 @@ Set `-base-url` in the CLI or `llm.Config.BaseURL` in the SDK for a compatible g
 
 ## Multimodal input
 
-The message model carries binary media as first-class content blocks: `llm.ImageBlock(mediaType, base64)` for images (PNG/JPEG/GIF/WEBP) and `llm.DocumentBlock(mediaType, base64)` for documents (PDF). Media enters conversations through the **Read** tool — the model reads a file and the SDK returns it as a block — and through hosts that assemble `llm.Message` values directly.
+The **Read** tool returns native image blocks for PNG, JPEG, GIF, and WebP and native document blocks for PDF, up to 5 MiB per file. It extracts paragraphs, cell values, and slide text from DOCX, XLSX, and PPTX on every provider. Office text extraction omits page layout, charts, and embedded images.
 
-| Wire format | Images | PDF documents | Office documents (docx/xlsx/pptx) |
-|---|---|---|---|
-| Anthropic Messages | native `image` block | native `document` block | extracted text |
-| OpenAI Chat Completions | `image_url` data-URI parts (user messages; media from tool results is promoted to a following user message) | text notice (no native input) | extracted text |
-| OpenAI Responses | native `input_image` part | native `input_file` part | extracted text |
+Hosts can also build media attachments in a user `llm.Message` and pass it through `llm.CompletionRequest.Messages` or `harness.QueryInput.Messages`. Use `llm.ImageBlock(mediaType, base64)` for inline images or `llm.DocumentBlock(mediaType, base64)` for inline documents. For a remote image or document, construct a media block with `Source: &llm.BlockSource{Type: "url", URL: url}`. To reference an existing file, use `Source: &llm.BlockSource{Type: "file", FileID: id}`. The URL must be accessible to the configured provider. File IDs must belong to that provider and be accessible to the credentials used for the request.
 
-Office extraction is structural, not styled — paragraphs, cell values, and slide text runs — and works on every provider because it is plain text. Known limitations: media does not cross the subagent boundary (the Agent tool's prompt is a string; subagents read files themselves); PostToolUse hooks observe flattened text only; MicroCompact clears stale image-bearing tool results like any other old tool result; the compaction summarizer sees `[image … omitted]` placeholders instead of payloads; MCP servers returning `image` content get it passed through, other non-text MCP content types degrade to notices.
+| Wire format | Image sources | PDF sources | Office originals passed by the host | Tool-result media |
+|---|---|---|---|---|
+| Anthropic Messages | Base64, URL, file ID | Base64, URL, file ID | Unsupported | Native blocks inside `tool_result` |
+| OpenAI Chat Completions | Base64, URL | Base64, file ID | Unsupported | Media follows the tool replies in a user message |
+| OpenAI Responses | Base64, URL, file ID | Base64, URL, file ID | DOCX, XLSX, PPTX via Base64, URL, or file ID | Native parts inside `function_call_output.output` |
+
+Use `llm.MediaTypeDOCX`, `llm.MediaTypeXLSX`, or `llm.MediaTypePPTX` with `DocumentBlock` for inline Office files. Set `Source.Filename` to preserve a filename on OpenAI requests. The SDK supplies a default filename for inline PDF and these Office formats. Set `Source.Detail` for OpenAI image inputs or Responses PDF inputs. The accepted detail levels depend on the API and model. For PDF URL or file ID references, optionally set `Source.MediaType` to `llm.MediaTypePDF`. OpenAI-compatible gateways must support the listed wire shapes to accept these attachments.
+
+`Session.Prompt`, the CLI, and subagent prompts accept text. Agents using those entry points can read local attachments through `Read`. PostToolUse hooks receive flattened text. MicroCompact clears stale media-bearing tool results, and the compaction summarizer sees media placeholders. MCP image results retain their image blocks. Other non-text MCP results become notices.
 
 ## Tool permissions
 

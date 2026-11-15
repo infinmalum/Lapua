@@ -375,7 +375,7 @@ func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
 		if len(content) == 0 {
 			continue // empty content array is rejected by Anthropic — drop it
 		}
-		content = stripThoughtSignatures(content)
+		content = anthropicContent(content)
 		if len(content) == len(m.Content) && sameBacking(content, m.Content) {
 			out = append(out, m)
 		} else {
@@ -385,27 +385,54 @@ func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
 	return out
 }
 
-// stripThoughtSignatures clears ThoughtSignature on every block, copying only
-// when at least one is set so untouched history keeps sharing its backing array.
-// Callers own the returned slice; the input is never mutated — it belongs to the
-// caller's conversation state and must survive the request unchanged.
-func stripThoughtSignatures(content []ContentBlock) []ContentBlock {
-	idx := -1
+// anthropicContent removes provider-specific metadata from the wire copy and
+// replaces unsupported attachments with a notice. It leaves history intact.
+func anthropicContent(content []ContentBlock) []ContentBlock {
+	var out []ContentBlock
 	for i, b := range content {
-		if b.ThoughtSignature != "" {
-			idx = i
-			break
+		wire := b
+		wire.ThoughtSignature = ""
+		switch b.Type {
+		case BlockImage, BlockDocument:
+			src := anthropicMediaSource(b)
+			if src == nil {
+				wire = TextBlock(mediaNotice(b))
+			} else if *src != *b.Source {
+				wire.Source = src
+			}
+		case BlockToolResult:
+			wire.Content = anthropicContent(b.Content)
 		}
+		if wire.ThoughtSignature == b.ThoughtSignature && wire.Type == b.Type &&
+			wire.Source == b.Source && sameBacking(wire.Content, b.Content) {
+			continue
+		}
+		if out == nil {
+			out = append([]ContentBlock(nil), content...)
+		}
+		out[i] = wire
 	}
-	if idx < 0 {
+	if out == nil {
 		return content
 	}
-	out := make([]ContentBlock, len(content))
-	copy(out, content)
-	for i := idx; i < len(out); i++ {
-		out[i].ThoughtSignature = ""
-	}
 	return out
+}
+
+func anthropicMediaSource(b ContentBlock) *BlockSource {
+	s := b.Source
+	if s == nil || (b.Type == BlockDocument && s.MediaType != "" && s.MediaType != MediaTypePDF) {
+		return nil
+	}
+	switch {
+	case s.Type == "base64" && s.MediaType != "" && s.Data != "":
+		return &BlockSource{Type: s.Type, MediaType: s.MediaType, Data: s.Data}
+	case s.Type == "url" && s.URL != "":
+		return &BlockSource{Type: s.Type, URL: s.URL}
+	case s.Type == "file" && s.FileID != "":
+		return &BlockSource{Type: s.Type, FileID: s.FileID}
+	default:
+		return nil
+	}
 }
 
 // sameBacking reports whether two slices share their first element's address,

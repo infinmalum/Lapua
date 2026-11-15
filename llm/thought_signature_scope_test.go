@@ -46,13 +46,13 @@ func TestAnthropicRequestDropsThoughtSignature(t *testing.T) {
 
 // Histories with no signature anywhere must keep sharing their backing array —
 // stripping is a no-op that should not allocate a copy per turn.
-func TestStripThoughtSignaturesNoCopyWhenUnset(t *testing.T) {
+func TestAnthropicContentNoCopyWhenUnchanged(t *testing.T) {
 	content := []ContentBlock{
 		TextBlock("hi"),
 		{Type: BlockToolUse, ID: "c1", Name: "Bash"},
 	}
-	if got := stripThoughtSignatures(content); &got[0] != &content[0] {
-		t.Error("stripThoughtSignatures copied a slice that had nothing to strip")
+	if got := anthropicContent(content); &got[0] != &content[0] {
+		t.Error("anthropicContent copied a slice with unchanged wire content")
 	}
 }
 

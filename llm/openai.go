@@ -18,9 +18,9 @@ type openaiProvider struct{ cfg Config }
 // it nil rather than assigning "" — an interface holding "" serializes as
 // "content":"". Response parsing uses its own string-typed structs.
 type oaMessage struct {
-	Role             string `json:"role"`
-	Content          any    `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string       `json:"role"`
+	Content          any          `json:"content,omitempty"`
+	ReasoningContent string       `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string       `json:"tool_call_id,omitempty"`
 }
@@ -28,13 +28,21 @@ type oaMessage struct {
 // oaContentPart is one entry of a content-parts array — the Chat Completions
 // multimodal input shape.
 type oaContentPart struct {
-	Type     string      `json:"type"` // "text" | "image_url"
+	Type     string      `json:"type"` // "text" | "image_url" | "file"
 	Text     string      `json:"text,omitempty"`
 	ImageURL *oaImageURL `json:"image_url,omitempty"`
+	File     *oaFile     `json:"file,omitempty"`
 }
 
 type oaImageURL struct {
-	URL string `json:"url"` // data URI: "data:<media_type>;base64,<data>"
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type oaFile struct {
+	FileID   string `json:"file_id,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 type oaToolCall struct {
@@ -166,12 +174,8 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 			}
 			out = append(out, om)
 		case RoleUser:
-			// Media handling: an image block turns the user message into a
-			// content-parts array (text stays a string otherwise); a document
-			// block has no Chat Completions input shape and degrades to a text
-			// notice; media nested inside a tool_result is promoted to a
-			// following user message because role:tool content must stay a
-			// string for maximum gateway compatibility.
+			// User media requires content parts. Tool messages carry text, so
+			// their media is moved to the user message after all tool replies.
 			var text strings.Builder
 			var toolMsgs []oaMessage
 			var parts []oaContentPart
@@ -191,7 +195,12 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				switch b.Type {
 				case BlockText:
 					addText(b.Text)
-				case BlockImage:
+				case BlockImage, BlockDocument:
+					part := oaMediaPart(b)
+					if part.Type == "text" {
+						addText(part.Text)
+						continue
+					}
 					if !hasMedia {
 						hasMedia = true
 						if s := text.String(); s != "" {
@@ -199,21 +208,17 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 							text.Reset()
 						}
 					}
-					parts = append(parts, oaImagePart(b))
-				case BlockDocument:
-					addText(documentNotice(b))
+					parts = append(parts, part)
 				case BlockToolResult:
-					tm := oaMessage{Role: "tool", ToolCallID: b.ToolUseID}
-					if s := flattenText(b.Content); s != "" {
-						tm.Content = s
-					}
-					toolMsgs = append(toolMsgs, tm)
+					// Even an empty string must be serialized: content is
+					// required for a tool message.
+					toolMsgs = append(toolMsgs, oaMessage{
+						Role: "tool", ToolCallID: b.ToolUseID, Content: flattenText(b.Content),
+					})
 					for _, nb := range b.Content {
 						switch nb.Type {
-						case BlockImage:
-							promoted = append(promoted, oaImagePart(nb))
-						case BlockDocument:
-							promoted = append(promoted, oaContentPart{Type: "text", Text: documentNotice(nb)})
+						case BlockImage, BlockDocument:
+							promoted = append(promoted, oaMediaPart(nb))
 						}
 					}
 				}
@@ -323,26 +328,37 @@ func flattenText(blocks []ContentBlock) string {
 // dislike image-only user turns) a text anchor.
 const toolMediaAnchor = "[media returned by tool calls]"
 
-// documentNotice renders a document block for a provider without native
-// document input (Chat Completions). The tool layer is provider-agnostic, so
-// this notice at the adapter boundary is the only place the limitation can be
-// surfaced without failing the whole request.
-func documentNotice(b ContentBlock) string {
-	media := "unknown"
+// mediaNotice is used when an adapter cannot send a media source from the
+// shared message model, for example an Office attachment replayed into Chat.
+func mediaNotice(b ContentBlock) string {
+	media := ""
 	if b.Source != nil && b.Source.MediaType != "" {
-		media = b.Source.MediaType
+		media = " " + b.Source.MediaType
 	}
-	return fmt.Sprintf("[document %s omitted: this provider does not accept document input]", media)
+	return fmt.Sprintf("[%s%s omitted: unsupported attachment source for this API]", b.Type, media)
 }
 
-// oaImagePart converts an image block into a Chat Completions image_url part
-// with a base64 data URI.
-func oaImagePart(b ContentBlock) oaContentPart {
-	u := ""
-	if b.Source != nil {
-		u = "data:" + b.Source.MediaType + ";base64," + b.Source.Data
+func oaMediaPart(b ContentBlock) oaContentPart {
+	s := b.Source
+	if s != nil {
+		switch b.Type {
+		case BlockImage:
+			switch {
+			case s.Type == "base64" && s.MediaType != "" && s.Data != "":
+				return oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: s.dataURI(), Detail: s.Detail}}
+			case s.Type == "url" && s.URL != "":
+				return oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: s.URL, Detail: s.Detail}}
+			}
+		case BlockDocument:
+			switch {
+			case s.Type == "base64" && s.MediaType == MediaTypePDF && s.Data != "":
+				return oaContentPart{Type: "file", File: &oaFile{FileData: s.dataURI(), Filename: s.documentFilename()}}
+			case s.Type == "file" && s.FileID != "" && (s.MediaType == "" || s.MediaType == MediaTypePDF):
+				return oaContentPart{Type: "file", File: &oaFile{FileID: s.FileID}}
+			}
+		}
 	}
-	return oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: u}}
+	return oaContentPart{Type: "text", Text: mediaNotice(b)}
 }
 
 func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {

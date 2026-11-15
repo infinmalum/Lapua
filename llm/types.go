@@ -29,25 +29,55 @@ const (
 	BlockDocument   BlockType = "document"
 )
 
-// Media types a base64 BlockSource may carry. The image set is what both the
-// Anthropic Messages API and the OpenAI image-input endpoints accept; PDF is
-// the only document media type with native provider support.
+// Media types for images, PDFs, and Office documents.
 const (
 	MediaTypePNG  = "image/png"
 	MediaTypeJPEG = "image/jpeg"
 	MediaTypeGIF  = "image/gif"
 	MediaTypeWEBP = "image/webp"
 	MediaTypePDF  = "application/pdf"
+	MediaTypeDOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	MediaTypeXLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	MediaTypePPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
 
-// BlockSource carries the binary payload of an image or document block. The
-// shape mirrors Anthropic's block.source object ({type, media_type, data}),
-// which is also directly mappable to an OpenAI data URI
-// ("data:<media_type>;base64,<data>").
+// BlockSource supplies an image or document. Type selects the payload:
+// "base64" uses MediaType and Data, "url" uses URL, and "file" uses FileID.
+// For a URL or file ID, an optional MediaType identifies the referenced format.
+// File IDs must belong to the configured provider and be accessible with its
+// credentials. Filename names a base64 document for OpenAI; Detail selects
+// OpenAI image fidelity or Responses PDF fidelity. Providers use their
+// default when Detail is empty.
 type BlockSource struct {
-	Type      string `json:"type"` // "base64"
+	Type      string `json:"type"`
 	MediaType string `json:"media_type,omitempty"`
 	Data      string `json:"data,omitempty"` // base64-encoded bytes
+	URL       string `json:"url,omitempty"`
+	FileID    string `json:"file_id,omitempty"`
+	Filename  string `json:"filename,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+func (s *BlockSource) dataURI() string {
+	return "data:" + s.MediaType + ";base64," + s.Data
+}
+
+func (s *BlockSource) documentFilename() string {
+	if s.Filename != "" {
+		return s.Filename
+	}
+	switch s.MediaType {
+	case MediaTypePDF:
+		return "document.pdf"
+	case MediaTypeDOCX:
+		return "document.docx"
+	case MediaTypeXLSX:
+		return "document.xlsx"
+	case MediaTypePPTX:
+		return "document.pptx"
+	default:
+		return ""
+	}
 }
 
 // ContentBlock is one piece of message content. Which fields are populated
@@ -102,25 +132,9 @@ type ContentBlock struct {
 	Content   []ContentBlock `json:"content,omitempty"`
 	IsError   bool           `json:"is_error,omitempty"`
 
-	// Source carries the base64 payload when Type is BlockImage (Type populated
-	// with a MediaType constant such as MediaTypePNG) or BlockDocument
-	// (MediaTypePDF). All other block types leave it nil.
-	//
-	// Serialization semantics differ per provider, mirroring the
-	// ThoughtSignature split above:
-	//
-	//   - Anthropic: ContentBlock is marshaled straight into anthropicReq, so an
-	//     image/document block reaches the wire verbatim as
-	//     {"type":"image","source":{...}} — the native shape, including when
-	//     nested inside a tool_result's Content. No adapter code involved.
-	//   - OpenAI Chat Completions: toOpenAIMessages renders images as
-	//     image_url content parts (data URIs); document blocks have no native
-	//     Chat Completions input and are rendered as a text notice instead.
-	//     Media nested in a tool_result is promoted to a following user message,
-	//     because role:tool content must stay a string for maximum gateway
-	//     compatibility.
-	//   - OpenAI Responses: rendered as input_image / input_file content parts,
-	//     with the same promotion for tool-result-nested media.
+	// Source is set on BlockImage and BlockDocument. Chat Completions moves
+	// tool-result media to a following user message. Anthropic and Responses
+	// send supported media as part of the tool result.
 	Source *BlockSource `json:"source,omitempty"`
 }
 
@@ -133,9 +147,9 @@ func ImageBlock(mediaType, base64Data string) ContentBlock {
 	}
 }
 
-// DocumentBlock builds a document content block carrying base64 data. Only
-// MediaTypePDF has native provider support (Anthropic Messages, OpenAI
-// Responses); providers without it render the block as a text notice.
+// DocumentBlock builds a document content block carrying base64 data.
+// PDF is supported by all built-in adapters; Responses also accepts Office
+// documents. Set Source.Filename to provide the original filename.
 func DocumentBlock(mediaType, base64Data string) ContentBlock {
 	return ContentBlock{
 		Type:   BlockDocument,
