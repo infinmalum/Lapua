@@ -59,6 +59,14 @@ func Capture(tc *ToolContext, s string) string {
 // Deprecated: use Capture for strings or CapResult for tool results.
 func CaptureOnce(tc *ToolContext, s string) string { return Capture(tc, s) }
 
+// mediaFixedChars is the budget cost of one image/document block. The payload
+// is base64 and can far exceed the whole text budget on its own, but its model
+// cost is fixed (~2000 tokens ≈ 8000 chars, the same convention compaction
+// uses), so it is charged the fixed cost instead of its wire length. Charging
+// the raw JSON length would push any media-bearing result past the budget and
+// destroy the image by replacing the whole result with truncated JSON text.
+const mediaFixedChars = 8000
+
 // CapResult applies a shared budget across all content blocks. Capture may add
 // a short truncation notice or an absolute spill path outside the body budget.
 // Extra messages are host-provided conversation instructions and have their own
@@ -75,6 +83,10 @@ func CapResult(tc *ToolContext, res Result) Result {
 			remaining -= 1 + len(block.Text)
 		} else {
 			textOnly = false
+			if block.Type == llm.BlockImage || block.Type == llm.BlockDocument {
+				remaining -= mediaFixedChars
+				continue
+			}
 			encoded, err := json.Marshal(block)
 			if err != nil {
 				return Errorf("Error: invalid tool output")

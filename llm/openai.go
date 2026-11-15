@@ -12,12 +12,29 @@ import (
 
 type openaiProvider struct{ cfg Config }
 
+// oaMessage.Content is a union: a plain string (every message the neutral model
+// produces without images) or an []oaContentPart parts array (a user message
+// carrying image blocks). omitempty drops it only when nil, so sites must leave
+// it nil rather than assigning "" — an interface holding "" serializes as
+// "content":"". Response parsing uses its own string-typed structs.
 type oaMessage struct {
-	Role             string       `json:"role"`
-	Content          string       `json:"content,omitempty"`
-	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	Role             string `json:"role"`
+	Content          any    `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string       `json:"tool_call_id,omitempty"`
+}
+
+// oaContentPart is one entry of a content-parts array — the Chat Completions
+// multimodal input shape.
+type oaContentPart struct {
+	Type     string      `json:"type"` // "text" | "image_url"
+	Text     string      `json:"text,omitempty"`
+	ImageURL *oaImageURL `json:"image_url,omitempty"`
+}
+
+type oaImageURL struct {
+	URL string `json:"url"` // data URI: "data:<media_type>;base64,<data>"
 }
 
 type oaToolCall struct {
@@ -86,7 +103,10 @@ type oaStreamOpts struct {
 
 // toOpenAIMessages flattens the unified model into OpenAI's role-based format:
 // assistant tool_use → tool_calls; user-embedded tool_result → standalone
-// role:tool messages; system prompt → leading system message (FR-03.6).
+// role:tool messages; system prompt → leading system message (FR-03.6). Image
+// blocks become content-parts arrays on user messages and are promoted out of
+// tool results into a following user message; document blocks degrade to text
+// notices (no Chat Completions document input).
 func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 	out := make([]oaMessage, 0, len(msgs)+1)
 	if system != "" {
@@ -126,7 +146,9 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 					om.ToolCalls = append(om.ToolCalls, tc)
 				}
 			}
-			om.Content = text.String()
+			if s := text.String(); s != "" {
+				om.Content = s
+			}
 			if s := reasoning.String(); s != "" {
 				om.ReasoningContent = s
 			}
@@ -139,23 +161,74 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 			// thinking mode requires it), and keeping the assistant turn also
 			// preserves user/assistant alternation for gateways that enforce it
 			// (dropping it would leave two adjacent user messages).
-			if om.Content == "" && len(om.ToolCalls) == 0 {
+			if om.Content == nil && len(om.ToolCalls) == 0 {
 				om.Content = "…"
 			}
 			out = append(out, om)
 		case RoleUser:
+			// Media handling: an image block turns the user message into a
+			// content-parts array (text stays a string otherwise); a document
+			// block has no Chat Completions input shape and degrades to a text
+			// notice; media nested inside a tool_result is promoted to a
+			// following user message because role:tool content must stay a
+			// string for maximum gateway compatibility.
 			var text strings.Builder
 			var toolMsgs []oaMessage
+			var parts []oaContentPart
+			var promoted []oaContentPart
+			hasMedia := false
+			addText := func(s string) {
+				if s == "" {
+					return
+				}
+				if hasMedia {
+					parts = append(parts, oaContentPart{Type: "text", Text: s})
+				} else {
+					text.WriteString(s)
+				}
+			}
 			for _, b := range m.Content {
 				switch b.Type {
 				case BlockText:
-					text.WriteString(b.Text)
+					addText(b.Text)
+				case BlockImage:
+					if !hasMedia {
+						hasMedia = true
+						if s := text.String(); s != "" {
+							parts = append(parts, oaContentPart{Type: "text", Text: s})
+							text.Reset()
+						}
+					}
+					parts = append(parts, oaImagePart(b))
+				case BlockDocument:
+					addText(documentNotice(b))
 				case BlockToolResult:
-					toolMsgs = append(toolMsgs, oaMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: flattenText(b.Content)})
+					tm := oaMessage{Role: "tool", ToolCallID: b.ToolUseID}
+					if s := flattenText(b.Content); s != "" {
+						tm.Content = s
+					}
+					toolMsgs = append(toolMsgs, tm)
+					for _, nb := range b.Content {
+						switch nb.Type {
+						case BlockImage:
+							promoted = append(promoted, oaImagePart(nb))
+						case BlockDocument:
+							promoted = append(promoted, oaContentPart{Type: "text", Text: documentNotice(nb)})
+						}
+					}
 				}
 			}
 			out = append(out, toolMsgs...)
-			if s := text.String(); s != "" {
+			if len(promoted) > 0 {
+				promoted = append([]oaContentPart{{Type: "text", Text: toolMediaAnchor}}, promoted...)
+				out = append(out, oaMessage{Role: "user", Content: promoted})
+			}
+			if hasMedia {
+				if s := text.String(); s != "" {
+					parts = append(parts, oaContentPart{Type: "text", Text: s})
+				}
+				out = append(out, oaMessage{Role: "user", Content: parts})
+			} else if s := text.String(); s != "" {
 				out = append(out, oaMessage{Role: "user", Content: s})
 			}
 		}
@@ -212,7 +285,7 @@ func sanitizeOpenAIMessages(msgs []oaMessage, thinking bool) []oaMessage {
 		}
 		// An assistant message must carry content or tool_calls; a turn emptied by
 		// the drop above would serialize to a bare {"role":"assistant"} and 400.
-		if msgs[i].Content == "" && len(msgs[i].ToolCalls) == 0 {
+		if msgs[i].Content == nil && len(msgs[i].ToolCalls) == 0 {
 			msgs[i].Content = "…"
 		}
 	}
@@ -243,6 +316,33 @@ func flattenText(blocks []ContentBlock) string {
 		}
 	}
 	return s.String()
+}
+
+// toolMediaAnchor prefixes the synthetic user message that carries media
+// promoted out of tool results, giving the model (and strict gateways that
+// dislike image-only user turns) a text anchor.
+const toolMediaAnchor = "[media returned by tool calls]"
+
+// documentNotice renders a document block for a provider without native
+// document input (Chat Completions). The tool layer is provider-agnostic, so
+// this notice at the adapter boundary is the only place the limitation can be
+// surfaced without failing the whole request.
+func documentNotice(b ContentBlock) string {
+	media := "unknown"
+	if b.Source != nil && b.Source.MediaType != "" {
+		media = b.Source.MediaType
+	}
+	return fmt.Sprintf("[document %s omitted: this provider does not accept document input]", media)
+}
+
+// oaImagePart converts an image block into a Chat Completions image_url part
+// with a base64 data URI.
+func oaImagePart(b ContentBlock) oaContentPart {
+	u := ""
+	if b.Source != nil {
+		u = "data:" + b.Source.MediaType + ";base64," + b.Source.Data
+	}
+	return oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: u}}
 }
 
 func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {

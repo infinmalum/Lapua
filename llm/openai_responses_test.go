@@ -159,9 +159,9 @@ func TestToResponsesInput(t *testing.T) {
 	if in[3].Type != "function_call_output" || in[3].CallID != "c1" || in[3].Output != "file.txt" {
 		t.Fatalf("item3=%+v", in[3])
 	}
-	// thinking must not leak into any item.
+	// thinking must not leak into any item (string or parts-array content).
 	for _, it := range in {
-		if strings.Contains(it.Content, "dropped") {
+		if b, err := json.Marshal(it); err == nil && strings.Contains(string(b), "dropped") {
 			t.Fatalf("thinking leaked: %+v", it)
 		}
 	}

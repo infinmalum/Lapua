@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
+	"github.com/infinmalum/Lapua/llm"
 	"github.com/infinmalum/Lapua/permission"
 	"github.com/infinmalum/Lapua/tool"
 )
@@ -229,24 +231,53 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 				return tool.Errorf("Error: " + err.Error()), nil
 			}
 			var res struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-				IsError bool `json:"isError"`
+				Content []mcpContentBlock `json:"content"`
+				IsError bool              `json:"isError"`
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return tool.Errorf("Error: bad MCP response: " + err.Error()), nil
 			}
-			var text string
-			for _, blk := range res.Content {
-				text += blk.Text
-			}
-			out := tool.Text(text)
-			out.IsError = res.IsError
+			out := mcpContentToResult(res.Content, res.IsError)
 			return tool.CapResult(tc, out), nil
 		},
 	})
+}
+
+// mcpContentBlock is one entry of an MCP tools/call response content array.
+type mcpContentBlock struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+// mcpContentToResult converts an MCP response's content array into a tool
+// Result: text accumulates, image blocks pass through as native image blocks
+// at their original position, and any other typed content (audio, resource
+// links, …) degrades to a short notice rather than vanishing silently.
+func mcpContentToResult(content []mcpContentBlock, isError bool) tool.Result {
+	var blocks []llm.ContentBlock
+	var text strings.Builder
+	for _, blk := range content {
+		switch blk.Type {
+		case "text":
+			text.WriteString(blk.Text)
+		case "image":
+			if text.Len() > 0 {
+				blocks = append(blocks, llm.TextBlock(text.String()))
+				text.Reset()
+			}
+			blocks = append(blocks, llm.ImageBlock(blk.MimeType, blk.Data))
+		default:
+			text.WriteString(fmt.Sprintf("\n[%s content omitted from tool result]", blk.Type))
+		}
+	}
+	if text.Len() > 0 || len(blocks) == 0 {
+		blocks = append(blocks, llm.TextBlock(text.String()))
+	}
+	out := tool.Result{Content: blocks}
+	out.IsError = isError
+	return out
 }
 
 // Close shuts down the client's transport.

@@ -25,7 +25,30 @@ const (
 	BlockThinking   BlockType = "thinking"
 	BlockToolUse    BlockType = "tool_use"
 	BlockToolResult BlockType = "tool_result"
+	BlockImage      BlockType = "image"
+	BlockDocument   BlockType = "document"
 )
+
+// Media types a base64 BlockSource may carry. The image set is what both the
+// Anthropic Messages API and the OpenAI image-input endpoints accept; PDF is
+// the only document media type with native provider support.
+const (
+	MediaTypePNG  = "image/png"
+	MediaTypeJPEG = "image/jpeg"
+	MediaTypeGIF  = "image/gif"
+	MediaTypeWEBP = "image/webp"
+	MediaTypePDF  = "application/pdf"
+)
+
+// BlockSource carries the binary payload of an image or document block. The
+// shape mirrors Anthropic's block.source object ({type, media_type, data}),
+// which is also directly mappable to an OpenAI data URI
+// ("data:<media_type>;base64,<data>").
+type BlockSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"` // base64-encoded bytes
+}
 
 // ContentBlock is one piece of message content. Which fields are populated
 // depends on Type. This is the Anthropic content-block union.
@@ -78,6 +101,46 @@ type ContentBlock struct {
 	ToolUseID string         `json:"tool_use_id,omitempty"`
 	Content   []ContentBlock `json:"content,omitempty"`
 	IsError   bool           `json:"is_error,omitempty"`
+
+	// Source carries the base64 payload when Type is BlockImage (Type populated
+	// with a MediaType constant such as MediaTypePNG) or BlockDocument
+	// (MediaTypePDF). All other block types leave it nil.
+	//
+	// Serialization semantics differ per provider, mirroring the
+	// ThoughtSignature split above:
+	//
+	//   - Anthropic: ContentBlock is marshaled straight into anthropicReq, so an
+	//     image/document block reaches the wire verbatim as
+	//     {"type":"image","source":{...}} — the native shape, including when
+	//     nested inside a tool_result's Content. No adapter code involved.
+	//   - OpenAI Chat Completions: toOpenAIMessages renders images as
+	//     image_url content parts (data URIs); document blocks have no native
+	//     Chat Completions input and are rendered as a text notice instead.
+	//     Media nested in a tool_result is promoted to a following user message,
+	//     because role:tool content must stay a string for maximum gateway
+	//     compatibility.
+	//   - OpenAI Responses: rendered as input_image / input_file content parts,
+	//     with the same promotion for tool-result-nested media.
+	Source *BlockSource `json:"source,omitempty"`
+}
+
+// ImageBlock builds an image content block carrying base64 data (mediaType is
+// one of the MediaType constants).
+func ImageBlock(mediaType, base64Data string) ContentBlock {
+	return ContentBlock{
+		Type:   BlockImage,
+		Source: &BlockSource{Type: "base64", MediaType: mediaType, Data: base64Data},
+	}
+}
+
+// DocumentBlock builds a document content block carrying base64 data. Only
+// MediaTypePDF has native provider support (Anthropic Messages, OpenAI
+// Responses); providers without it render the block as a text notice.
+func DocumentBlock(mediaType, base64Data string) ContentBlock {
+	return ContentBlock{
+		Type:   BlockDocument,
+		Source: &BlockSource{Type: "base64", MediaType: mediaType, Data: base64Data},
+	}
 }
 
 // TextBlock builds a text content block.

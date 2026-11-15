@@ -80,15 +80,28 @@ func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Mes
 	return msgs, true
 }
 
+// noaMediaTokens is the fixed token cost charged per image/document block in
+// estimates: media is size-independent for the model (~2000 tokens), while its
+// Text carries only the short stub — charging len(Text) would price it ~0.
+const noaMediaTokens = 2000
+
 // estimateMessages sizes a rebuilt request.
 func estimateMessages(msgs []llm.Message) int {
 	total := 0
 	for _, m := range msgs {
 		for _, b := range m.Content {
+			if b.Type == llm.BlockImage || b.Type == llm.BlockDocument {
+				total += noaMediaTokens
+				continue
+			}
 			total += len(b.Text) / 4
 			total += len(b.Thinking) / 4
 			total += len(b.Input) / 4
 			for _, inner := range b.Content {
+				if inner.Type == llm.BlockImage || inner.Type == llm.BlockDocument {
+					total += noaMediaTokens
+					continue
+				}
 				total += len(inner.Text) / 4
 			}
 		}

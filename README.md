@@ -10,8 +10,8 @@ Build with Go 1.26.3 or later. Import SDK packages under `github.com/infinmalum/
 
 | Package | Responsibility |
 |---|---|
-| `llm` | Vendor-neutral message model (`Message`/`ContentBlock`/`StreamEvent`) + `Provider` interface. `NewProvider(Config{Format})` selects Anthropic Messages, OpenAI Chat Completions, or OpenAI Responses. Each adapter normalizes streaming and tool calls into the same event type. |
-| `tool` | `CoreTool` contract, fail-closed `Build` factory, `Registry`, a lightweight JSON-Schema validator, and the core tools: **Read, Write, Edit, MultiEdit, LS, Glob, Grep, Bash** (default set) plus opt-in **WebFetch** / **WebSearch** (network, permission-gated), **TodoWrite** (stateful planning), **AskUserQuestion** (structured mid-task questions), background-task tools (**TaskOutput/TaskStop/TaskList/Monitor**), and **deferred tools** — schemas withheld from the model to save context, discovered on demand via `SearchExtraTools` and invoked through `ExecuteExtraTool`. |
+| `llm` | Vendor-neutral message model (`Message`/`ContentBlock`/`StreamEvent`) + `Provider` interface. `NewProvider(Config{Format})` selects Anthropic Messages, OpenAI Chat Completions, or OpenAI Responses. Each adapter normalizes streaming and tool calls into the same event type. Image and document blocks (`ImageBlock`/`DocumentBlock`) are part of the message model; see [Multimodal input](#multimodal-input). |
+| `tool` | `CoreTool` contract, fail-closed `Build` factory, `Registry`, a lightweight JSON-Schema validator, and the core tools: **Read, Write, Edit, MultiEdit, LS, Glob, Grep, Bash** (default set) plus opt-in **WebFetch** / **WebSearch** (network, permission-gated), **TodoWrite** (stateful planning), **AskUserQuestion** (structured mid-task questions), background-task tools (**TaskOutput/TaskStop/TaskList/Monitor**), and **deferred tools** — schemas withheld from the model to save context, discovered on demand via `SearchExtraTools` and invoked through `ExecuteExtraTool`. Read handles non-text inputs by content: images (PNG/JPEG/GIF/WEBP ≤5MB) and PDFs return native image/document blocks; docx/xlsx/pptx return extracted text (stdlib-only); UTF-16 text is transcoded; other binaries are reported, not shown. |
 | `permission` | Evaluates allow and deny rules, tool policy, permission mode, and host approval. Deny rules take priority, including for deferred targets and nested agent calls. |
 | `harness` | The loop: `Query` streams `Event`s (`iter.Seq2`), schedules tools that declare concurrency safety in parallel and other tools exclusively, pairs every `tool_use` with a `tool_result` (synthetic on deny/abort), enforces termination reasons, and threads cancellation. `QueryDeps` injects side effects for testing. |
 | `compaction` | Context-window management: Snip / MicroCompact / Context Collapse / AutoCompact, a circuit breaker, reactive recovery from prompt-too-long, and non-destructive `compact_boundary` summaries. Invoked skills are re-injected verbatim after each boundary so their instructions survive summarization. |
@@ -73,6 +73,18 @@ Mutating tools (Write/Edit/Bash) prompt for approval unless `-yes` is set. Suppl
 | `openai-responses` | `llm.FormatOpenAIResponses` | `/responses` | `OPENAI_API_KEY`, `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) |
 
 Set `-base-url` in the CLI or `llm.Config.BaseURL` in the SDK for a compatible gateway. Include any API prefix the gateway requires, such as `/v1` for the default OpenAI base URL, and leave off the path in the table. Supply the model identifier accepted by that endpoint. All three SDK adapters support streaming and non-streaming requests. The CLI uses streaming. Implement `llm.Provider` to connect a different protocol.
+
+## Multimodal input
+
+The message model carries binary media as first-class content blocks: `llm.ImageBlock(mediaType, base64)` for images (PNG/JPEG/GIF/WEBP) and `llm.DocumentBlock(mediaType, base64)` for documents (PDF). Media enters conversations through the **Read** tool — the model reads a file and the SDK returns it as a block — and through hosts that assemble `llm.Message` values directly.
+
+| Wire format | Images | PDF documents | Office documents (docx/xlsx/pptx) |
+|---|---|---|---|
+| Anthropic Messages | native `image` block | native `document` block | extracted text |
+| OpenAI Chat Completions | `image_url` data-URI parts (user messages; media from tool results is promoted to a following user message) | text notice (no native input) | extracted text |
+| OpenAI Responses | native `input_image` part | native `input_file` part | extracted text |
+
+Office extraction is structural, not styled — paragraphs, cell values, and slide text runs — and works on every provider because it is plain text. Known limitations: media does not cross the subagent boundary (the Agent tool's prompt is a string; subagents read files themselves); PostToolUse hooks observe flattened text only; MicroCompact clears stale image-bearing tool results like any other old tool result; the compaction summarizer sees `[image … omitted]` placeholders instead of payloads; MCP servers returning `image` content get it passed through, other non-text MCP content types degrade to notices.
 
 ## Tool permissions
 

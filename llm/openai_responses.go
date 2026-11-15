@@ -41,17 +41,29 @@ type orReasoning struct {
 	Effort string `json:"effort"`
 }
 
-// orInputItem is a union: a message (Role+Content string, no Type) or a typed
-// function_call / function_call_output item. omitempty keeps each shape minimal
-// so the API sees exactly one well-formed variant per item.
+// orInputItem is a union: a message (Role+Content, no Type) or a typed
+// function_call / function_call_output item. Content is a string or, for a
+// message carrying media, an []orContentPart parts array (input_text /
+// input_image / input_file). omitempty keeps each shape minimal so the API sees
+// exactly one well-formed variant per item; it only drops nil, so empty content
+// must stay nil rather than "".
 type orInputItem struct {
 	Type      string `json:"type,omitempty"`
 	Role      string `json:"role,omitempty"`
-	Content   string `json:"content,omitempty"`
+	Content   any    `json:"content,omitempty"`
 	CallID    string `json:"call_id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 	Output    string `json:"output,omitempty"`
+}
+
+// orContentPart is one entry of a message item's content-parts array — the
+// Responses API multimodal input shape.
+type orContentPart struct {
+	Type     string `json:"type"` // "input_text" | "input_image" | "input_file"
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"` // data URI for base64 image sources
+	FileData string `json:"file_data,omitempty"` // data URI for base64 document sources
 }
 
 type orTool struct {
@@ -84,43 +96,117 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 }
 
 // toResponsesInput flattens neutral messages into Responses input items: text
-// becomes a role message (string content), tool_use becomes a function_call, and
-// tool_result becomes a function_call_output. Thinking blocks are dropped on
-// replay (mirrors the Chat Completions adapter's default and avoids echoing
-// provider-specific reasoning state the Responses API manages itself).
+// becomes a role message (string content, or a content-parts array when the
+// message carries image/document blocks), tool_use becomes a function_call, and
+// tool_result becomes a function_call_output with media promoted into a
+// following user message (output must stay a string). Thinking blocks are
+// dropped on replay (mirrors the Chat Completions adapter's default and avoids
+// echoing provider-specific reasoning state the Responses API manages itself).
 func toResponsesInput(msgs []Message) []orInputItem {
 	var out []orInputItem
 	for _, m := range msgs {
 		role := string(m.Role)
 		var text strings.Builder
-		// flushText emits accumulated text as a role message, preserving block
-		// order: a text block that precedes a tool_use/tool_result must appear
-		// before that item in the input array, not after it.
-		flushText := func() {
+		var parts []orContentPart
+		var promoted []orContentPart
+		hasMedia := false
+		// flush emits accumulated content as a role message, preserving block
+		// order: text/media preceding a tool_use/tool_result must appear before
+		// that item in the input array, not after it. A message with media is
+		// emitted as a content-parts array; text-only stays a plain string.
+		flush := func() {
+			if hasMedia {
+				if s := text.String(); s != "" {
+					parts = append(parts, orContentPart{Type: "input_text", Text: s})
+					text.Reset()
+				}
+				if len(parts) > 0 {
+					out = append(out, orInputItem{Role: role, Content: parts})
+					parts = nil
+				}
+				return
+			}
 			if s := text.String(); s != "" {
 				out = append(out, orInputItem{Role: role, Content: s})
 				text.Reset()
 			}
 		}
+		addText := func(s string) {
+			if s == "" {
+				return
+			}
+			if hasMedia {
+				parts = append(parts, orContentPart{Type: "input_text", Text: s})
+				return
+			}
+			text.WriteString(s)
+		}
+		enterMedia := func() {
+			if !hasMedia {
+				hasMedia = true
+				if s := text.String(); s != "" {
+					parts = append(parts, orContentPart{Type: "input_text", Text: s})
+					text.Reset()
+				}
+			}
+		}
 		for _, b := range m.Content {
 			switch b.Type {
 			case BlockText:
-				text.WriteString(b.Text)
+				addText(b.Text)
+			case BlockImage:
+				enterMedia()
+				parts = append(parts, orImagePart(b))
+			case BlockDocument:
+				enterMedia()
+				parts = append(parts, orFilePart(b))
 			case BlockToolUse:
-				flushText()
+				flush()
 				args := string(b.Input)
 				if strings.TrimSpace(args) == "" {
 					args = "{}"
 				}
 				out = append(out, orInputItem{Type: "function_call", CallID: b.ID, Name: b.Name, Arguments: args})
 			case BlockToolResult:
-				flushText()
+				flush()
 				out = append(out, orInputItem{Type: "function_call_output", CallID: b.ToolUseID, Output: flattenText(b.Content)})
+				for _, nb := range b.Content {
+					switch nb.Type {
+					case BlockImage:
+						promoted = append(promoted, orImagePart(nb))
+					case BlockDocument:
+						promoted = append(promoted, orFilePart(nb))
+					}
+				}
 			}
 		}
-		flushText()
+		flush()
+		if len(promoted) > 0 {
+			promoted = append([]orContentPart{{Type: "input_text", Text: toolMediaAnchor}}, promoted...)
+			out = append(out, orInputItem{Role: "user", Content: promoted})
+		}
 	}
 	return out
+}
+
+// orImagePart converts an image block into a Responses input_image part with a
+// base64 data URI.
+func orImagePart(b ContentBlock) orContentPart {
+	u := ""
+	if b.Source != nil {
+		u = "data:" + b.Source.MediaType + ";base64," + b.Source.Data
+	}
+	return orContentPart{Type: "input_image", ImageURL: u}
+}
+
+// orFilePart converts a document block into a Responses input_file part with a
+// base64 data URI (file_data).
+func orFilePart(b ContentBlock) orContentPart {
+	d := ""
+	if b.Source != nil {
+		d = "data:" + b.Source.MediaType + ";base64," + b.Source.Data
+	}
+	return orContentPart{Type: "input_file", FileData: d}
 }
 
 func (p *openaiResponsesProvider) setHeaders(r *http.Request) {

@@ -1,7 +1,10 @@
 package noaadapter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/infinmalum/Lapua/llm"
@@ -13,7 +16,13 @@ import (
 type origin struct {
 	msgIdx int
 	blkIdx int
+	// nested is >= 0 when the core projects a media block nested inside the
+	// tool_result at (msgIdx, blkIdx) rather than that block itself; -1
+	// otherwise.
+	nested int
 }
+
+func originAt(msgIdx, blkIdx int) origin { return origin{msgIdx: msgIdx, blkIdx: blkIdx, nested: -1} }
 
 // Sidecar carries what the flat representation cannot: provider-internal data
 // that must survive the round trip untouched.
@@ -63,27 +72,39 @@ func Project(msgs []llm.Message) ([]noa.CoreMessage, *Sidecar) {
 
 	for mi, m := range msgs {
 		for bi, b := range m.Content {
-			core, ok := projectBlock(m.Role, b, toolNameByCallID)
-			if !ok {
-				continue
+			for _, pc := range projectBlockCores(m.Role, b, toolNameByCallID) {
+				core := pc.core
+				core.ID = cc.Next(DeriveMessageID(core.Role, core.ContentType, core.Text, core.ToolCallID, core.ToolName))
+				o := originAt(mi, bi)
+				if pc.nested >= 0 {
+					o.nested = pc.nested
+				}
+				sc.Origins[core.ID] = o
+				if b.Type == llm.BlockThinking {
+					sc.Signatures[core.ID] = b.Signature
+				}
+				if b.Type == llm.BlockToolResult && b.IsError {
+					sc.ToolResultIsError[core.ID] = true
+				}
+				out = append(out, core)
 			}
-			core.ID = cc.Next(DeriveMessageID(core.Role, core.ContentType, core.Text, core.ToolCallID, core.ToolName))
-			sc.Origins[core.ID] = origin{msgIdx: mi, blkIdx: bi}
-			if b.Type == llm.BlockThinking {
-				sc.Signatures[core.ID] = b.Signature
-			}
-			if b.Type == llm.BlockToolResult && b.IsError {
-				sc.ToolResultIsError[core.ID] = true
-			}
-			out = append(out, core)
 		}
 	}
 	return out, sc
 }
 
-// projectBlock maps one content block; ok=false means the block has no
-// representation in the flat model.
-func projectBlock(role llm.Role, b llm.ContentBlock, toolNames map[string]string) (noa.CoreMessage, bool) {
+// projectedCore pairs a projected core with the nested index it came from
+// (nested < 0 for a core that projects a top-level block).
+type projectedCore struct {
+	core   noa.CoreMessage
+	nested int
+}
+
+// projectBlockCores maps one content block to 0..N cores. A tool_result whose
+// nested content carries image/document blocks projects those as sibling media
+// cores (each with its nested index), so they round-trip instead of vanishing;
+// ok=false shapes simply project to nothing.
+func projectBlockCores(role llm.Role, b llm.ContentBlock, toolNames map[string]string) []projectedCore {
 	switch b.Type {
 	case llm.BlockText:
 		r := noa.RoleAssistant
@@ -93,28 +114,85 @@ func projectBlock(role llm.Role, b llm.ContentBlock, toolNames map[string]string
 			// Only user text carries a tag, and it must not reach the hash.
 			text = StripRefTag(text)
 		}
-		return noa.CoreMessage{Role: r, ContentType: noa.CTText, Text: text}, true
+		return single(noa.CoreMessage{Role: r, ContentType: noa.CTText, Text: text})
 
 	case llm.BlockThinking:
-		return noa.CoreMessage{Role: noa.RoleAssistant, ContentType: noa.CTReasoning, Text: b.Thinking}, true
+		return single(noa.CoreMessage{Role: noa.RoleAssistant, ContentType: noa.CTReasoning, Text: b.Thinking})
 
 	case llm.BlockToolUse:
-		return noa.CoreMessage{
+		return single(noa.CoreMessage{
 			Role: noa.RoleAssistant, ContentType: noa.CTToolCall,
 			ToolName: b.Name, ToolCallID: b.ID, Text: string(b.Input),
-		}, true
+		})
+
+	case llm.BlockImage, llm.BlockDocument:
+		return single(mediaCore(noaRole(role), b))
 
 	case llm.BlockToolResult:
-		return noa.CoreMessage{
-			Role: noa.RoleTool, ContentType: noa.CTToolResult,
-			ToolCallID: b.ToolUseID, ToolName: toolNames[b.ToolUseID],
-			Text: StripRefTag(flattenToolResult(b.Content)),
-		}, true
+		cores := []projectedCore{{
+			core: noa.CoreMessage{
+				Role: noa.RoleTool, ContentType: noa.CTToolResult,
+				ToolCallID: b.ToolUseID, ToolName: toolNames[b.ToolUseID],
+				Text: StripRefTag(flattenToolResult(b.Content)),
+			},
+			nested: -1,
+		}}
+		for i, nb := range b.Content {
+			if !isMediaBlock(nb) {
+				continue
+			}
+			// Nested media projects as a sibling with RoleTool, since it rides
+			// in the tool result.
+			mc := mediaCore(noa.RoleTool, nb)
+			cores = append(cores, projectedCore{core: mc, nested: i})
+		}
+		return cores
 
 	default:
 		// compact_boundary and anything else the host may add: not content.
-		return noa.CoreMessage{}, false
+		return nil
 	}
+}
+
+func single(c noa.CoreMessage) []projectedCore {
+	return []projectedCore{{core: c, nested: -1}}
+}
+
+func isMediaBlock(b llm.ContentBlock) bool {
+	return b.Type == llm.BlockImage || b.Type == llm.BlockDocument
+}
+
+// mediaCore projects one image/document block: a core whose Text is a stub
+// (media type + short payload hash) — token counts, archives, and compressor
+// prompts see the placeholder, while the payload itself round-trips through
+// the original block at reassembly.
+func mediaCore(role noa.Role, b llm.ContentBlock) noa.CoreMessage {
+	ct := noa.CTImage
+	label := "image"
+	if b.Type == llm.BlockDocument {
+		ct = noa.CTDocument
+		label = "document"
+	}
+	media, data := "", ""
+	if b.Source != nil {
+		media = b.Source.MediaType
+		data = b.Source.Data
+	}
+	sum := sha256.Sum256([]byte(data))
+	return noa.CoreMessage{
+		Role:        role,
+		ContentType: ct,
+		Text:        fmt.Sprintf("[%s %s #%s]", label, media, hex.EncodeToString(sum[:])[:8]),
+	}
+}
+
+// noaRole maps a host role onto noa's (tool-role media cores ride in tool
+// results and get noa.RoleTool directly; everything else is user or assistant).
+func noaRole(r llm.Role) noa.Role {
+	if r == llm.RoleAssistant {
+		return noa.RoleAssistant
+	}
+	return noa.RoleUser
 }
 
 // flattenToolResult joins a tool result's nested blocks into one body.
@@ -209,6 +287,15 @@ func rebuildMessage(orig llm.Message, group []noa.CoreMessage, sc *Sidecar, opts
 		if !ok || o.blkIdx >= len(orig.Content) {
 			continue
 		}
+		// A nested media core re-attaches the original payload block: media is
+		// never rewritten by the pipeline, so the block passes through as-is.
+		if o.nested >= 0 {
+			blk := orig.Content[o.blkIdx]
+			if o.nested < len(blk.Content) {
+				content = append(content, blk.Content[o.nested])
+			}
+			continue
+		}
 		b := orig.Content[o.blkIdx]
 		content = append(content, rebuildBlock(b, c, sc, opts))
 	}
@@ -256,6 +343,11 @@ func rebuildBlock(b llm.ContentBlock, c noa.CoreMessage, sc *Sidecar, opts Reass
 		}
 		b.Content = []llm.ContentBlock{llm.TextBlock(body)}
 		b.IsError = sc.ToolResultIsError[c.ID]
+
+	case llm.BlockImage, llm.BlockDocument:
+		// Media pass-through: the payload lives in the original block's Source
+		// and the pipeline never rewrites it — the stub Text in the core is
+		// identity/accounting only.
 	}
 	return b
 }

@@ -10,6 +10,7 @@
 .claude/
 .agents/
 .playwright-mcp/
+.zcode/
 
 # Local docs / analysis notes
 docs/

@@ -144,9 +144,16 @@ func EstimateTokens(msgs []llm.Message) int {
 	return chars / 4
 }
 
-// blockChars is the per-block character footprint. A Norma ContentBlock has no
-// image/document type; if one is added, its fixed 2000-token cost (claude-code
-// IMAGE_MAX_TOKEN_SIZE) would be added here.
+// mediaBlockChars is the fixed character footprint of one image/document block:
+// its model cost is ~2000 tokens regardless of byte size (claude-code's
+// IMAGE_MAX_TOKEN_SIZE convention), so its multi-megabyte base64 payload must
+// NOT be counted — that would over-estimate by orders of magnitude and fire
+// compaction far too early. 2000 tokens × 4 chars/token.
+const mediaBlockChars = 8000
+
+// blockChars is the per-block character footprint. Image and document blocks
+// are charged the fixed media cost (their token cost is size-independent);
+// every other block is charged by its text length.
 func blockChars(b llm.ContentBlock) int {
 	switch b.Type {
 	case llm.BlockText:
@@ -155,6 +162,8 @@ func blockChars(b llm.ContentBlock) int {
 		return len(b.Thinking)
 	case llm.BlockToolUse:
 		return len(b.Name) + len(b.Input)
+	case llm.BlockImage, llm.BlockDocument:
+		return mediaBlockChars
 	case llm.BlockToolResult:
 		n := 0
 		for _, cb := range b.Content {
@@ -300,7 +309,7 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	if tailStart <= start {
 		return msgs, false
 	}
-	toSummarize := contentOnly(msgs[start:tailStart])
+	toSummarize := strippedForSummary(msgs[start:tailStart])
 	if len(toSummarize) == 0 {
 		return msgs, false
 	}
@@ -420,12 +429,64 @@ func reinjectSkills(msgs []llm.Message, tailStart int) []llm.Message {
 	return out
 }
 
-func contentOnly(msgs []llm.Message) []llm.Message {
+// mediaSummaryPlaceholder is the text that replaces an image/document block in
+// the summarizer replay. The summary needs to know media existed, not its
+// bytes: a multi-megabyte base64 payload would bloat the summary request and
+// could defeat the PTL retry's group-based truncation.
+func mediaSummaryPlaceholder(b llm.ContentBlock) string {
+	media := ""
+	if b.Source != nil {
+		media = b.Source.MediaType
+	}
+	if b.Type == llm.BlockImage {
+		return "[image " + media + " omitted from summary]"
+	}
+	return "[document " + media + " omitted from summary]"
+}
+
+func isMediaBlock(b llm.ContentBlock) bool {
+	return b.Type == llm.BlockImage || b.Type == llm.BlockDocument
+}
+
+// strippedForSummary drops boundary markers and replaces image/document blocks
+// (top-level and nested inside tool results) with short text placeholders, so
+// the summarizer replays the conversation's shape without its base64 payloads.
+func strippedForSummary(msgs []llm.Message) []llm.Message {
 	out := make([]llm.Message, 0, len(msgs))
 	for _, m := range msgs {
-		if !llm.IsBoundaryMarker(m) {
-			out = append(out, m)
+		if llm.IsBoundaryMarker(m) {
+			continue
 		}
+		blocks := make([]llm.ContentBlock, 0, len(m.Content))
+		changed := false
+		for _, b := range m.Content {
+			if isMediaBlock(b) {
+				blocks = append(blocks, llm.TextBlock(mediaSummaryPlaceholder(b)))
+				changed = true
+				continue
+			}
+			if b.Type == llm.BlockToolResult {
+				nested := make([]llm.ContentBlock, 0, len(b.Content))
+				nChanged := false
+				for _, nb := range b.Content {
+					if isMediaBlock(nb) {
+						nested = append(nested, llm.TextBlock(mediaSummaryPlaceholder(nb)))
+						nChanged = true
+						continue
+					}
+					nested = append(nested, nb)
+				}
+				if nChanged {
+					changed = true
+					b.Content = nested
+				}
+			}
+			blocks = append(blocks, b)
+		}
+		if changed {
+			m.Content = blocks
+		}
+		out = append(out, m)
 	}
 	return out
 }

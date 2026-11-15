@@ -1,21 +1,30 @@
 package tool
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
+
+	"github.com/infinmalum/Lapua/llm"
 )
 
 // NewRead builds the Read tool: reads a file with cat -n style line numbers and
-// optional offset/limit.
+// optional offset/limit. Images and PDFs (up to maxMediaBytes) are returned as
+// native image/document content blocks for multimodal providers; Office
+// documents (docx/xlsx/pptx) are returned as extracted text; UTF-16 text is
+// transcoded to UTF-8; other binaries are reported, not shown.
 func NewRead() CoreTool {
 	return Build(Spec{
 		Name:        "Read",
-		Description: "Reads a file from the local filesystem and returns its contents with line numbers. Use offset/limit for large files. Always read a file before editing it.",
-		Prompt:      "file_path may be absolute or relative to the working directory. Output lines are prefixed with their 1-based line number.",
+		Description: "Reads a file from the local filesystem and returns its contents with line numbers. Use offset/limit for large files. Always read a file before editing it. PNG/JPEG/GIF/WEBP images and PDFs up to 5MB come back as native image/document blocks (supported providers only); docx/xlsx/pptx come back as extracted text; other binary files are reported, not shown.",
+		Prompt:      "file_path may be absolute or relative to the working directory. Output lines are prefixed with their 1-based line number. Media payloads do not carry line numbers.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -54,6 +63,15 @@ func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Errorf(fmt.Sprintf("Error reading %s: %v", in.FilePath, err)), nil
+	}
+	// UTF-16 text carries a NUL byte in the high half of every ASCII character
+	// and would trip the binary heuristic below; transcode to UTF-8 first so
+	// Excel's "Unicode text" exports and Windows UTF-16 files read normally.
+	if s, ok := decodeUTF16(data); ok {
+		data = []byte(s)
+	}
+	if res, handled := readMedia(tc, in.FilePath, data); handled {
+		return res, nil
 	}
 	if isBinary(data) {
 		return Text(fmt.Sprintf("[binary file %s not shown — %d bytes]", in.FilePath, len(data))), nil
@@ -143,6 +161,109 @@ func isBinary(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// maxMediaBytes caps the raw payload Read will return as an image or document
+// content block. Anthropic accepts ~5MB per image and 32MB per PDF; 5MB for
+// both keeps the base64 expansion (~1.33x) and the request size bounded. Media
+// results self-cap (cappedAt), so they bypass the shared text budget.
+const maxMediaBytes = 5 << 20
+
+// sniffMedia reports the media type of an image or PDF by magic bytes — never
+// by file extension, which the model may have gotten wrong.
+func sniffMedia(data []byte) string {
+	switch {
+	case len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}):
+		return llm.MediaTypePNG
+	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
+		return llm.MediaTypeJPEG
+	case len(data) >= 6 && (bytes.Equal(data[:6], []byte("GIF87a")) || bytes.Equal(data[:6], []byte("GIF89a"))):
+		return llm.MediaTypeGIF
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+		return llm.MediaTypeWEBP
+	case len(data) >= 5 && bytes.Equal(data[:5], []byte("%PDF-")):
+		return llm.MediaTypePDF
+	}
+	return ""
+}
+
+// decodeUTF16 transcodes a UTF-16 byte order mark'd payload to UTF-8. ok=false
+// for everything else (including plain ASCII, which has no BOM).
+func decodeUTF16(data []byte) (string, bool) {
+	if len(data) < 4 || len(data)%2 != 0 {
+		return "", false
+	}
+	littleEndian := false
+	switch {
+	case data[0] == 0xFF && data[1] == 0xFE:
+		littleEndian = true
+	case data[0] == 0xFE && data[1] == 0xFF:
+	default:
+		return "", false
+	}
+	u16 := make([]uint16, 0, (len(data)-2)/2)
+	for i := 2; i+1 < len(data); i += 2 {
+		if littleEndian {
+			u16 = append(u16, uint16(data[i])|uint16(data[i+1])<<8)
+		} else {
+			u16 = append(u16, uint16(data[i])<<8|uint16(data[i+1]))
+		}
+	}
+	return string(utf16.Decode(u16)), true
+}
+
+// readMedia handles Read's non-plain-text inputs by content: images and PDFs
+// become native image/document blocks; OOXML Office documents are decompressed
+// to text. handled=false falls through to the binary placeholder. Media results
+// set cappedAt so the shared text budget never truncates their payload.
+func readMedia(tc *ToolContext, display string, data []byte) (Result, bool) {
+	media := sniffMedia(data)
+	if media == "" {
+		return readOffice(tc, display, data)
+	}
+	if len(data) > maxMediaBytes {
+		return Errorf(fmt.Sprintf(
+			"Error: %s is a %d-byte %s; Read returns media up to %d bytes as content blocks. Extract the needed content another way.",
+			display, len(data), media, maxMediaBytes)), true
+	}
+	enc := base64.StdEncoding.EncodeToString(data)
+	var res Result
+	if media == llm.MediaTypePDF {
+		res = Result{Content: []llm.ContentBlock{llm.DocumentBlock(media, enc)}}
+	} else {
+		res = Result{Content: []llm.ContentBlock{llm.ImageBlock(media, enc)}}
+	}
+	res.cappedAt = maxOut(tc)
+	return res, true
+}
+
+// readOffice extracts text from OOXML Office documents (docx/xlsx/pptx, which
+// are zip archives of XML parts). A zip that is not an Office document is not
+// handled, so it falls through to the binary placeholder.
+func readOffice(tc *ToolContext, display string, data []byte) (Result, bool) {
+	if len(data) < 4 || data[0] != 'P' || data[1] != 'K' {
+		return Result{}, false
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return Result{}, false // corrupt zip: treat as an ordinary binary
+	}
+	kind, ok := sniffOffice(zr)
+	if !ok {
+		return Result{}, false
+	}
+	text, err := extractOffice(zr, kind)
+	if err != nil {
+		return Errorf(fmt.Sprintf("Error reading %s: %s document could not be read: %v", display, kind, err)), true
+	}
+	body := fmt.Sprintf("[Office %s: extracted text of %s (%d source bytes)]\n%s", kind, display, len(data), text)
+	// Extracted text is synthetic, so offset paging (the regular Read path)
+	// does not apply: bound it with the head+tail truncation instead, and mark
+	// the result self-capped like the other Read outputs.
+	body = truncate(body, maxOut(tc)+readOutputBonus)
+	res := Text(body)
+	res.cappedAt = maxOut(tc)
+	return res, true
 }
 
 // NewWrite builds the Write tool: creates or overwrites a file.

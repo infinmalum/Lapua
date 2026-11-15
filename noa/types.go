@@ -33,6 +33,12 @@ const (
 	CTToolCall   ContentType = "tool-call"
 	CTToolResult ContentType = "tool-result"
 	CTReasoning  ContentType = "reasoning"
+	// CTImage / CTDocument carry binary media from a host's image/document
+	// block. Their Text holds only a short stub (media type + payload hash), so
+	// token counting, archives, and compressor prompts see the placeholder,
+	// never the bytes.
+	CTImage    ContentType = "image"
+	CTDocument ContentType = "document"
 )
 
 // CoreMessage is the flattened intermediate representation the pipeline works
